@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#2563eb">
+    <title>Аналитика столов</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+    <div class="logo">
+        <h1>Аналитика игровых столов</h1>
+    </div>
+    <div class="controls">
+        <input type="date" id="datePicker">
+        <button class="btn btn-ghost" id="todayBtn">Сегодня</button>
+        <button class="btn btn-primary" id="refreshBtn">Обновить</button>
+        <a href="/logout"><button class="btn btn-danger">Выйти</button></a>
+    </div>
+</header>
+
+<div class="container">
+    <div class="summary" id="summary"></div>
+    <div class="section-title">Столы</div>
+    <div id="loading" class="loading">Загрузка...</div>
+    <div id="tables" class="tables-grid"></div>
+</div>
+
+<script src="script.js"></script>
+</body>
+</html>
