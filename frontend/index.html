@@ -2,19 +2,18 @@
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <meta name="mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#2563eb">
-    <title>Аналитика столов</title>
+    <title>Аналитика клуба настольного тенниса</title>
     <link rel="stylesheet" href="style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 </head>
 <body>
 
 <header>
-    <div class="logo">
-        <h1>Аналитика игровых столов</h1>
+    <div class="header-left">
+        <h1>Аналитика клуба настольного тенниса</h1>
+        <div class="updated" id="updatedAt">обновлено —</div>
     </div>
     <div class="controls">
         <input type="date" id="datePicker">
@@ -25,10 +24,90 @@
 </header>
 
 <div class="container">
-    <div class="summary" id="summary"></div>
-    <div class="section-title">Столы</div>
-    <div id="loading" class="loading">Загрузка...</div>
-    <div id="tables" class="tables-grid"></div>
+
+    <!-- KPI cards -->
+    <div class="kpi-grid">
+        <div class="kpi-card">
+            <div class="kpi-label">Часы аренды сегодня</div>
+            <div class="kpi-value" id="kpiHoursToday">— <span>ч</span></div>
+            <div class="kpi-sub" id="kpiHoursTrend">—</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Сейчас занято</div>
+            <div class="kpi-value" id="kpiBusy">— <span>/ —</span></div>
+            <div class="kpi-sub" id="kpiBusySub">— загрузка</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Часы за неделю</div>
+            <div class="kpi-value" id="kpiWeek">— <span>ч</span></div>
+            <div class="kpi-sub" id="kpiWeekTrend">—</div>
+        </div>
+        <div class="kpi-card">
+            <div class="kpi-label">Среднее время игры</div>
+            <div class="kpi-value" id="kpiAvg">— <span>мин</span></div>
+            <div class="kpi-sub">по сегодняшним сессиям</div>
+        </div>
+    </div>
+
+    <!-- Cameras -->
+    <div class="cameras-grid">
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Камера 1</div>
+                <span class="live-badge">● LIVE</span>
+            </div>
+            <div class="camera-wrap">
+                <img id="cam1" class="camera-img" alt="Камера 1" src="/api/cameras/1/snapshot">
+            </div>
+            <div class="panel-foot">Столы 1-6</div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">
+                <div class="panel-title">Камера 2</div>
+                <span class="live-badge">● LIVE</span>
+            </div>
+            <div class="camera-wrap">
+                <img id="cam2" class="camera-img" alt="Камера 2" src="/api/cameras/2/snapshot">
+            </div>
+            <div class="panel-foot">Столы 7-12</div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="charts-grid">
+        <div class="panel">
+            <div class="panel-title">Занятость по часам (сегодня)</div>
+            <div class="chart-wrap"><canvas id="hoursChart"></canvas></div>
+        </div>
+        <div class="panel">
+            <div class="panel-title">Занятость по дням недели</div>
+            <div class="chart-wrap"><canvas id="weekChart"></canvas></div>
+        </div>
+    </div>
+
+    <!-- Top tables -->
+    <div class="panel">
+        <div class="panel-title">Топ загруженных столов сегодня</div>
+        <div class="top-grid" id="topGrid"></div>
+    </div>
+
+    <!-- Tables list -->
+    <div class="panel">
+        <div class="panel-title">По столам</div>
+        <table class="tables-table">
+            <thead>
+                <tr>
+                    <th>№ Стола</th>
+                    <th>Часы сегодня</th>
+                    <th>Часы за неделю</th>
+                    <th>Сессий сегодня</th>
+                    <th>Статус сейчас</th>
+                </tr>
+            </thead>
+            <tbody id="tablesBody"></tbody>
+        </table>
+    </div>
+
 </div>
 
 <script src="script.js"></script>

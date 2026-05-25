@@ -3,7 +3,6 @@
 :root {
     --accent: #2563eb;
     --accent-hover: #1d4ed8;
-    --accent-light: #eff6ff;
     --bg: #f1f5f9;
     --surface: #ffffff;
     --surface-2: #f8fafc;
@@ -11,7 +10,11 @@
     --text: #0f172a;
     --text-muted: #64748b;
     --text-light: #94a3b8;
-    --empty: #94a3b8;
+    --success: #22c55e;
+    --success-bg: #dcfce7;
+    --warning: #f59e0b;
+    --warning-bg: #fef3c7;
+    --danger: #ef4444;
     --shadow: 0 1px 3px rgba(0,0,0,0.08), 0 1px 2px rgba(0,0,0,0.04);
     --shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.05);
 }
@@ -23,11 +26,10 @@ body {
     min-height: 100vh;
 }
 
-/* ===================== HEADER ===================== */
+/* ===== HEADER ===== */
 header {
     background: var(--accent);
-    padding: 0 32px;
-    height: 64px;
+    padding: 12px 32px;
     display: flex;
     align-items: center;
     justify-content: space-between;
@@ -38,11 +40,17 @@ header {
     box-shadow: 0 2px 8px rgba(37,99,235,0.3);
 }
 
-.logo h1 {
+.header-left h1 {
     font-size: 17px;
     font-weight: 600;
     color: #ffffff;
-    white-space: nowrap;
+    line-height: 1.2;
+}
+
+.updated {
+    font-size: 12px;
+    color: rgba(255,255,255,0.7);
+    margin-top: 2px;
 }
 
 .controls {
@@ -60,14 +68,13 @@ header {
     font-size: 14px;
     outline: none;
     cursor: pointer;
-    transition: border-color 0.15s;
 }
 
 .controls input[type="date"]:focus {
     border-color: rgba(255,255,255,0.6);
 }
 
-/* ===================== BUTTONS ===================== */
+/* ===== BUTTONS ===== */
 .btn {
     padding: 8px 16px;
     border-radius: 8px;
@@ -83,10 +90,7 @@ header {
     white-space: nowrap;
 }
 
-.btn-primary {
-    background: #ffffff;
-    color: var(--accent);
-}
+.btn-primary { background: #ffffff; color: var(--accent); }
 .btn-primary:hover { background: #f0f4ff; }
 
 .btn-ghost {
@@ -103,289 +107,250 @@ header {
 }
 .btn-danger:hover { background: rgba(255,255,255,0.15); }
 
-/* ===================== CONTAINER ===================== */
+/* ===== CONTAINER ===== */
 .container {
-    max-width: 1280px;
+    max-width: 1400px;
     margin: 0 auto;
-    padding: 32px 24px;
-}
-
-/* ===================== SUMMARY ===================== */
-.summary {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
     gap: 16px;
-    margin-bottom: 28px;
 }
 
-.summary-card {
+/* ===== KPI CARDS ===== */
+.kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.kpi-card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-top: 3px solid var(--accent);
     border-radius: 12px;
-    padding: 16px 24px;
+    padding: 16px 20px;
     box-shadow: var(--shadow);
 }
 
-.summary-card .label {
-    font-size: 12px;
+.kpi-label {
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-muted);
     margin-bottom: 6px;
 }
 
-.summary-card .value {
-    font-size: 28px;
+.kpi-value {
+    font-size: 26px;
     font-weight: 700;
-    color: var(--accent);
+    color: var(--text);
     line-height: 1.1;
 }
 
-.summary-card .value span {
+.kpi-value span {
     font-size: 14px;
     font-weight: 400;
     color: var(--text-muted);
-    margin-left: 2px;
 }
 
-/* ===================== SECTION TITLE ===================== */
-.section-title {
-    font-size: 13px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+.kpi-sub {
+    font-size: 12px;
     color: var(--text-muted);
-    margin-bottom: 16px;
+    margin-top: 6px;
 }
 
-/* ===================== TABLES GRID ===================== */
-.tables-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-    gap: 14px;
-}
+.kpi-sub.up { color: var(--success); }
+.kpi-sub.down { color: var(--danger); }
 
-.table-card {
+/* ===== PANEL ===== */
+.panel {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 12px;
-    padding: 20px;
+    padding: 16px 20px;
     box-shadow: var(--shadow);
-    transition: box-shadow 0.15s, transform 0.15s;
-    position: relative;
-    overflow: hidden;
 }
 
-.table-card:hover {
-    box-shadow: var(--shadow-md);
-    transform: translateY(-2px);
+.panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
 }
 
-.table-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 3px;
-    background: var(--accent);
+.panel-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
 }
 
-.table-card.empty::before {
-    background: var(--border);
-}
-
-.table-card.live {
-    border-color: #22c55e;
-}
-
-.table-card.live::before {
-    background: #22c55e;
+.panel-foot {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 8px;
 }
 
 .live-badge {
     font-size: 11px;
     font-weight: 700;
-    color: #22c55e;
-    margin-bottom: 6px;
-    letter-spacing: 0.5px;
+    color: var(--success);
+    padding: 3px 10px;
+    background: var(--success-bg);
+    border-radius: 12px;
 }
 
-.table-num {
+/* ===== CAMERAS ===== */
+.cameras-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.camera-wrap {
+    aspect-ratio: 16/9;
+    background: #1a1a1a;
+    border-radius: 8px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* ===== CHARTS ===== */
+.charts-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.chart-wrap {
+    height: 220px;
+    position: relative;
+}
+
+/* ===== TOP TABLES ===== */
+.top-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+}
+
+.top-item {
+    background: var(--surface-2);
+    border-radius: 10px;
+    padding: 14px 16px;
+    border-left: 3px solid var(--accent);
+}
+
+.top-rank {
     font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.top-name {
+    font-size: 16px;
     font-weight: 600;
+    margin-bottom: 4px;
+}
+
+.top-stats {
+    font-size: 12px;
+    color: var(--text-muted);
+}
+
+/* ===== TABLES TABLE ===== */
+.tables-table {
+    width: 100%;
+    font-size: 13px;
+    border-collapse: collapse;
+}
+
+.tables-table thead th {
+    text-align: left;
+    padding: 10px 8px;
+    color: var(--text-muted);
+    font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: var(--text-muted);
-    margin-bottom: 10px;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
 }
 
-.table-time {
-    font-size: 28px;
-    font-weight: 700;
-    color: var(--text);
-    line-height: 1;
-    margin-bottom: 8px;
+.tables-table tbody td {
+    padding: 12px 8px;
+    border-bottom: 1px solid var(--border);
 }
 
-.table-card.empty .table-time {
-    color: var(--text-muted);
+.tables-table tbody tr:last-child td {
+    border-bottom: none;
 }
 
-.table-sessions {
+.status-pill {
+    display: inline-block;
+    padding: 4px 12px;
     font-size: 12px;
-    color: var(--text-light);
+    font-weight: 500;
+    border-radius: 12px;
 }
 
-/* ===================== LOADING ===================== */
-.loading {
-    text-align: center;
-    padding: 60px;
-    color: var(--text-muted);
-    font-size: 15px;
+.status-pill.free {
+    background: var(--success-bg);
+    color: #15803d;
 }
 
-/* ===================== FOOTER ===================== */
-footer {
-    text-align: center;
-    padding: 24px;
-    color: var(--text-light);
-    font-size: 12px;
-    border-top: 1px solid var(--border);
-    margin-top: 40px;
+.status-pill.busy {
+    background: var(--warning-bg);
+    color: #b45309;
 }
 
-/* =====================================================================
-   RESPONSIVE
-   - Десктоп:  > 1024px  — всё как есть
-   - Планшет:  768–1024px — 2 колонки в summary, 3 в таблицах
-   - Телефон:  < 768px   — хедер в 2 строки, 2 колонки таблицы
-   - Маленький: < 400px  — 1 колонка таблицы
-   ===================================================================== */
-
-/* --- Планшет --- */
+/* ===== RESPONSIVE ===== */
 @media (max-width: 1024px) {
-    .container {
-        padding: 24px 20px;
-    }
-
-    .tables-grid {
-        grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-    }
-
-    .table-time {
-        font-size: 24px;
-    }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    .charts-grid { grid-template-columns: 1fr; }
+    .top-grid { grid-template-columns: 1fr 1fr; }
 }
 
-/* --- Телефон --- */
 @media (max-width: 768px) {
-    /* Хедер становится двухстрочным */
     header {
-        height: auto;
-        padding: 12px 16px;
         flex-direction: column;
         align-items: flex-start;
+        padding: 12px 16px;
         gap: 10px;
-        position: sticky;
-        top: 0;
     }
-
-    .logo h1 {
-        font-size: 15px;
-    }
-
     .controls {
         width: 100%;
         flex-wrap: wrap;
         gap: 6px;
     }
-
     .controls input[type="date"] {
         flex: 1;
         min-width: 130px;
-        font-size: 13px;
-        padding: 7px 10px;
     }
-
-    .btn {
-        font-size: 13px;
-        padding: 7px 12px;
-    }
-
-    /* Контент */
-    .container {
-        padding: 16px 12px;
-    }
-
-    /* Summary — 3 карточки в ряд, компактнее */
-    .summary {
-        grid-template-columns: repeat(3, 1fr);
-        gap: 10px;
-        margin-bottom: 20px;
-    }
-
-    .summary-card {
-        padding: 12px 14px;
-    }
-
-    .summary-card .label {
-        font-size: 10px;
-    }
-
-    .summary-card .value {
-        font-size: 22px;
-    }
-
-    .summary-card .value span {
-        font-size: 12px;
-    }
-
-    /* Таблицы — 2 в ряд */
-    .tables-grid {
-        grid-template-columns: repeat(2, 1fr);
-        gap: 10px;
-    }
-
-    .table-card {
-        padding: 14px;
-    }
-
-    .table-time {
-        font-size: 22px;
-    }
-
-    .table-num {
-        font-size: 10px;
-        margin-bottom: 6px;
-    }
-
-    .live-badge {
-        font-size: 10px;
-        margin-bottom: 4px;
-    }
+    .container { padding: 12px; gap: 12px; }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .kpi-value { font-size: 20px; }
+    .kpi-label { font-size: 10px; }
+    .cameras-grid { grid-template-columns: 1fr; }
+    .charts-grid { grid-template-columns: 1fr; }
+    .top-grid { grid-template-columns: 1fr; }
+    .panel { padding: 12px 14px; }
+    .panel-title { font-size: 13px; }
+    .tables-table thead th { font-size: 10px; padding: 8px 4px; }
+    .tables-table tbody td { padding: 10px 4px; font-size: 12px; }
+    .status-pill { padding: 3px 8px; font-size: 11px; }
 }
 
-/* --- Маленький телефон --- */
-@media (max-width: 400px) {
-    /* Summary — 2 карточки видно нормально, третья по центру */
-    .summary {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    .summary:has(.summary-card:nth-child(3)) {
-        grid-template-columns: repeat(2, 1fr);
-    }
-
-    /* Таблицы — 1 в ряд */
-    .tables-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .table-time {
-        font-size: 26px;
-    }
-
-    .logo h1 {
-        font-size: 14px;
-    }
+@media (max-width: 480px) {
+    .kpi-grid { grid-template-columns: 1fr 1fr; }
+    .kpi-value { font-size: 18px; }
+    .header-left h1 { font-size: 14px; }
+    .btn { font-size: 12px; padding: 6px 10px; }
 }

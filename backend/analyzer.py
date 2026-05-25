@@ -13,18 +13,23 @@ TABLE_RULES_FILE = os.path.join(
     "data", "table_rules.json"
 )
 
+HOMOGRAPHY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "homography.json"
+)
+
+
 def load_table_rules():
     if not os.path.exists(TABLE_RULES_FILE):
         return {"default": {}}
     with open(TABLE_RULES_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
+
 def get_rules_for_table(all_rules, table_id):
     default = all_rules.get("default", {})
     specific = all_rules.get(str(table_id), {})
-    # Merge: специфичные правила переопределяют default
     merged = {**default, **specific}
-    # Дефолтные значения если ничего не задано
     merged.setdefault("min_stable_people", 2)
     merged.setdefault("score_threshold", 6)
     merged.setdefault("exit_threshold", 4)
@@ -32,6 +37,17 @@ def get_rules_for_table(all_rules, table_id):
     merged.setdefault("ignore_ball", False)
     merged.setdefault("require_movement", True)
     return merged
+
+
+def load_homographies():
+    """Загружает матрицы гомографии {camera_id: np.array 3x3}."""
+    if not os.path.exists(HOMOGRAPHY_FILE):
+        print("[WARN] homography.json not found - run marker_v2.py first!", flush=True)
+        return {}
+    with open(HOMOGRAPHY_FILE, 'r') as f:
+        raw = json.load(f)
+    return {int(k): np.array(v, dtype=np.float32) for k, v in raw.items()}
+
 
 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
@@ -48,10 +64,23 @@ CLASS_RACKET = 38
 
 MOVEMENT_THRESHOLD_LOW = 5
 
+# Расширение зоны стола НА ПОЛУ в миллиметрах
+# Игроки стоят примерно в 80-100 см от края стола
+FLOOR_EXPAND_MM = 1000
+
 ACTIVE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "data", "active.json"
 )
+
+SNAPSHOTS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "snapshots"
+)
+os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
+
+snapshot_lock = threading.Lock()
+last_snapshot_time = {}
 
 active_sessions_lock = threading.Lock()
 
@@ -81,81 +110,29 @@ def save_active_sessions(camera_id, sessions):
             with open(ACTIVE_FILE, 'w') as f:
                 json.dump(existing, f)
     except Exception as e:
-        print(f"[ERROR] Ошибка сохранения active.json: {e}", flush=True)
-
-
-def create_ball_detector():
-    """
-    Детектор мяча для настольного тенниса.
-    Ищет маленький белый/светлый круглый объект на столе.
-    Используем SimpleBlobDetector — без нейросетей, быстро.
-    """
-    params = cv2.SimpleBlobDetector_Params()
-
-    # Фильтр по цвету (ищем светлые объекты)
-    params.filterByColor = True
-    params.blobColor = 255  # белый
-
-    # Размер мяча в пикселях (зависит от расстояния камеры)
-    # При высоте ~4м и 1920px мяч ~8-20px в диаметре
-    params.filterByArea = True
-    params.minArea = 20    # минимум ~5px диаметр
-    params.maxArea = 800   # максимум ~32px диаметр
-
-    # Форма — круглый
-    params.filterByCircularity = True
-    params.minCircularity = 0.5
-
-    # Инерция (не вытянутый)
-    params.filterByInertia = True
-    params.minInertiaRatio = 0.3
-
-    # Выпуклость
-    params.filterByConvexity = True
-    params.minConvexity = 0.7
-
-    return cv2.SimpleBlobDetector_create(params)
+        print(f"[ERROR] save active.json: {e}", flush=True)
 
 
 def detect_ball_on_table(frame, zone_mask, prev_frame=None):
-    """
-    Ищет мяч для пинг-понга в зоне стола.
-
-    Стратегия:
-    1. Берём зону стола (синяя поверхность)
-    2. Ищем маленький белый круглый объект
-    3. Если есть предыдущий кадр — проверяем что объект движется (не просто пятно)
-
-    Возвращает список точек где найден мяч.
-    """
     balls = []
-
     try:
-        # Применяем маску зоны
         masked = cv2.bitwise_and(frame, frame, mask=zone_mask)
-
-        # Конвертируем в HSV для лучшего выделения белого мяча
         hsv = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
 
-        # Маска белого/светло-жёлтого цвета (мяч для пинг-понга)
-        # Белый: низкая насыщенность, высокая яркость
         lower_white = np.array([0, 0, 180])
         upper_white = np.array([180, 60, 255])
         white_mask = cv2.inRange(hsv, lower_white, upper_white)
 
-        # Светло-оранжевый/жёлтый мяч
         lower_orange = np.array([10, 100, 150])
         upper_orange = np.array([30, 255, 255])
         orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
 
         ball_mask = cv2.bitwise_or(white_mask, orange_mask)
 
-        # Убираем шум
         kernel = np.ones((3, 3), np.uint8)
         ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_OPEN, kernel)
         ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_CLOSE, kernel)
 
-        # Ищем контуры (альтернатива blob detector — надёжнее)
         contours, _ = cv2.findContours(ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for cnt in contours:
@@ -163,7 +140,6 @@ def detect_ball_on_table(frame, zone_mask, prev_frame=None):
             if area < 20 or area > 800:
                 continue
 
-            # Проверяем что это круглый объект
             perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
                 continue
@@ -171,7 +147,6 @@ def detect_ball_on_table(frame, zone_mask, prev_frame=None):
             if circularity < 0.4:
                 continue
 
-            # Центр объекта
             M = cv2.moments(cnt)
             if M["m00"] == 0:
                 continue
@@ -179,49 +154,38 @@ def detect_ball_on_table(frame, zone_mask, prev_frame=None):
             cy = int(M["m01"] / M["m00"])
             balls.append((cx, cy))
 
-    except Exception as e:
-        pass  # Тихо игнорируем ошибки детектора мяча
+    except Exception:
+        pass
 
     return balls
 
 
 class BallTracker:
-    """Отслеживает мяч между кадрами чтобы подтвердить что он движется."""
-
-    def __init__(self, table_id, zone_points, frame_w, frame_h, orig_w, orig_h, rules):
-        self.table_id = table_id
-        self.rules = rules
-    # ... остальное без изменений
+    def __init__(self):
+        self.positions = deque(maxlen=10)
+        self.last_seen = None
 
     def update(self, balls):
-        """Принимает список найденных позиций мяча, возвращает True если мяч движется."""
         if not balls:
             return False
 
-        # Берём первый найденный мяч
         pos = balls[0]
         now = time.time()
 
         if self.last_seen and (now - self.last_seen) > 3:
-            # Давно не видели — сбрасываем трек
             self.positions.clear()
 
         self.positions.append(pos)
         self.last_seen = now
 
-        # Мяч подтверждается только если:
-        # 1. Видели его 3+ кадра подряд (исключает разовые блики)
-        # 2. Сместился минимум на 15px (исключает неподвижные белые пятна)
         if len(self.positions) >= 3:
             dx = self.positions[-1][0] - self.positions[-3][0]
             dy = self.positions[-1][1] - self.positions[-3][1]
             dist = (dx*dx + dy*dy) ** 0.5
             return dist > 15
-
         return False
 
     def is_active(self):
-        """Мяч активен если видели его в последние 2 секунды."""
         if self.last_seen is None:
             return False
         return (time.time() - self.last_seen) < 2
@@ -256,31 +220,59 @@ class PersonTrack:
 
 
 class TableTracker:
-    def __init__(self, table_id, zone_points, frame_w, frame_h, orig_w, orig_h):
+    """Трекер стола с поддержкой гомографии.
+    Зоны хранятся в координатах ПОЛА (миллиметры).
+    Точки игроков переводятся в координаты пола через гомографию."""
+
+    def __init__(self, table_id, zone_data, homography, rules):
         self.table_id = table_id
+        self.rules = rules
+        self.homography = homography
 
-        scale_x = frame_w / orig_w if orig_w else 1.0
-        scale_y = frame_h / orig_h if orig_h else 1.0
+        # Зона на полу (миллиметры)
+        floor_pts = zone_data.get('points_floor')
+        pixel_pts = zone_data.get('points_pixel') or zone_data.get('points')
 
-        scaled = [(int(x * scale_x), int(y * scale_y)) for x, y in zone_points]
-        self.zone_points = np.array(scaled, np.int32)
-        self.expanded_zone = self._expand_zone(scaled, TABLE_EXPAND_PX)
+        if floor_pts is not None and homography is not None:
+            self.zone_floor = np.array(floor_pts, dtype=np.float32)
+            self.expanded_floor = self._expand_floor_zone(self.zone_floor, FLOOR_EXPAND_MM)
+            self.use_homography = True
+        else:
+            self.zone_floor = None
+            self.expanded_floor = None
+            self.use_homography = False
 
-        # Маска зоны стола (для детектора мяча)
-        self.zone_mask = None  # инициализируется при первом кадре
+        # Зона в пикселях — нужна для маски детектора мяча
+        self.zone_pixel = np.array(pixel_pts, np.int32)
 
+        # Расширенная пиксельная зона (fallback если нет гомографии)
+        self.expanded_pixel = self._expand_pixel_zone(pixel_pts, TABLE_EXPAND_PX)
+
+        self.zone_mask = None
         self.session_start = None
         self.last_active = None
         self.pending_confirmations = 0
-
         self.ball_tracker = BallTracker()
 
     def init_mask(self, frame_h, frame_w):
-        """Создаём маску зоны для детектора мяча (один раз)."""
         self.zone_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-        cv2.fillPoly(self.zone_mask, [self.zone_points], 255)
+        cv2.fillPoly(self.zone_mask, [self.zone_pixel], 255)
 
-    def _expand_zone(self, points, padding):
+    def _expand_floor_zone(self, points, padding_mm):
+        pts = np.array(points, dtype=np.float32)
+        center = pts.mean(axis=0)
+        expanded = []
+        for pt in pts:
+            direction = pt - center
+            length = np.linalg.norm(direction)
+            if length > 0:
+                unit = direction / length
+                expanded.append((pt + unit * padding_mm).tolist())
+            else:
+                expanded.append(pt.tolist())
+        return np.array(expanded, dtype=np.float32)
+
+    def _expand_pixel_zone(self, points, padding_px):
         pts = np.array(points, np.float32)
         center = pts.mean(axis=0)
         expanded = []
@@ -289,13 +281,35 @@ class TableTracker:
             length = np.linalg.norm(direction)
             if length > 0:
                 unit = direction / length
-                expanded.append((pt + unit * padding).astype(int).tolist())
+                expanded.append((pt + unit * padding_px).astype(int).tolist())
             else:
                 expanded.append(pt.astype(int).tolist())
         return np.array(expanded, np.int32)
 
+    def pixel_to_floor(self, point):
+        if self.homography is None:
+            return None
+        src = np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32)
+        dst = cv2.perspectiveTransform(src, self.homography)
+        return (float(dst[0][0][0]), float(dst[0][0][1]))
+
     def point_in_expanded(self, point):
-        return cv2.pointPolygonTest(self.expanded_zone, (float(point[0]), float(point[1])), False) >= 0
+        """Главная проверка — попадает ли точка в зону стола.
+        Если есть гомография — проверяем на полу. Иначе — на картинке."""
+        if self.use_homography:
+            floor_pt = self.pixel_to_floor(point)
+            if floor_pt is None:
+                return False
+            return cv2.pointPolygonTest(self.expanded_floor,
+                                        (float(floor_pt[0]), float(floor_pt[1])), False) >= 0
+        else:
+            return cv2.pointPolygonTest(self.expanded_pixel,
+                                        (float(point[0]), float(point[1])), False) >= 0
+
+    @property
+    def zone_points(self):
+        """Для обратной совместимости с кодом process_camera (для расчёта центра)."""
+        return self.zone_pixel
 
     def calculate_score(self, all_tracks, rackets, frame=None):
         nearby_tracks = []
@@ -323,12 +337,10 @@ class TableTracker:
 
         rackets_near = sum(1 for r in rackets if self.point_in_expanded(r))
 
-    # ГЛАВНЫЙ ФИЛЬТР: применяется только при СТАРТЕ новой сессии.
-    # Если сессия уже идёт — не блокируем (игроки могут отойти за мячом).
         if self.session_start is None and stable_count < self.rules["min_stable_people"]:
             if len(nearby_tracks) > 0:
-                print(f"  [Стол {self.table_id}] фильтр старта: "
-                    f"стабильных {stable_count} < {self.rules['min_stable_people']}", flush=True)
+                print(f"  [Table {self.table_id}] start filter: "
+                      f"stable {stable_count} < {self.rules['min_stable_people']}", flush=True)
             return 0
 
         racket_near_stable = False
@@ -344,7 +356,6 @@ class TableTracker:
                     racket_near_stable = True
                     break
 
-    # --- Детектор мяча ---
         ball_moving = False
         if frame is not None and self.zone_mask is not None:
             balls = detect_ball_on_table(frame, self.zone_mask)
@@ -352,58 +363,47 @@ class TableTracker:
 
         score = 0
 
-    # --- Стабильные игроки ---
         if stable_count >= 2:
             score += 5
         elif stable_count == 1:
             score += 2
 
-    # --- Движущиеся игроки ---
         if moving_count >= 2:
             score += 4
         elif moving_count == 1:
             score += 2
 
-    # --- Ракетки ---
         if racket_near_stable:
             score += 4
         elif rackets_near > 0:
             score += 2
 
-    # --- Интенсивность движения ---
         if max_movement > MOVEMENT_THRESHOLD_HIGH:
             score += 2
 
-    # --- Долго стоят у стола ---
         if max_stable_duration > 60:
             score += 2
 
-    # --- Просто люди рядом ---
         if len(nearby_tracks) >= 2:
             score += 1
 
-    # --- МЯЧ ДВИЖЕТСЯ (только если детектор не отключён правилами и есть люди) ---
         if not self.rules["ignore_ball"] and ball_moving and len(nearby_tracks) >= 1:
             score += 5
-            print(f"  [Стол {self.table_id}] 🏓 МЯЧ ДВИЖЕТСЯ! +5 к score", flush=True)
+            print(f"  [Table {self.table_id}] BALL MOVING +5", flush=True)
 
-    # --- Бонус из правил стола ---
         score += self.rules["score_bonus"]
 
         if len(nearby_tracks) > 0 or rackets_near > 0 or ball_moving:
-            print(f"  [Стол {self.table_id}] рядом={len(nearby_tracks)} "
-                f"стабильных={stable_count} "
-                f"движущихся={moving_count} "
-                f"мяч={'да' if ball_moving else 'нет'} "
-                f"ракетки={rackets_near} "
-                f"движение={int(max_movement)} "
-                f"score={score}", flush=True)
+            print(f"  [Table {self.table_id}] near={len(nearby_tracks)} "
+                  f"stable={stable_count} moving={moving_count} "
+                  f"ball={'y' if ball_moving else 'n'} "
+                  f"rackets={rackets_near} mov={int(max_movement)} "
+                  f"score={score}", flush=True)
 
         return score
 
     def update(self, score):
         now = time.time()
-        is_active = score >= SCORE_THRESHOLD
 
         if self.session_start is None:
             is_active = score >= self.rules["score_threshold"]
@@ -414,48 +414,47 @@ class TableTracker:
             self.pending_confirmations += 1
             if self.pending_confirmations >= CONFIRMATION_SECONDS and self.session_start is None:
                 self.session_start = now - (CONFIRMATION_SECONDS * FRAME_INTERVAL)
-                print(f"[Стол {self.table_id}] ▶ Сессия началась (score={score})", flush=True)
+                print(f"[Table {self.table_id}] > Session started (score={score})", flush=True)
             self.last_active = now
         else:
-
-            if is_active:
-                self.pending_confirmations += 1
-                if self.pending_confirmations >= CONFIRMATION_SECONDS and self.session_start is None:
-                    self.session_start = now - (CONFIRMATION_SECONDS * FRAME_INTERVAL)
-                    print(f"[Стол {self.table_id}] ▶ Сессия началась (score={score})", flush=True)
-                self.last_active = now
-            else:
-                self.pending_confirmations = 0
-                if self.session_start is not None and self.last_active is not None:
-                    absence = now - self.last_active
-                    if absence > ABSENCE_TOLERANCE:
-                        duration = self.last_active - self.session_start
-                        if duration >= MIN_GAME_DURATION:
-                            start_dt = datetime.fromtimestamp(self.session_start)
-                            end_dt = datetime.fromtimestamp(self.last_active)
-                            save_session(self.table_id, start_dt, end_dt)
-                            print(f"[Стол {self.table_id}] ⏹ Записано: {int(duration)} сек", flush=True)
-                        else:
-                            print(f"[Стол {self.table_id}] ⏹ Слишком коротко ({int(duration)} сек)", flush=True)
-                        self.session_start = None
-                        self.last_active = None
+            self.pending_confirmations = 0
+            if self.session_start is not None and self.last_active is not None:
+                absence = now - self.last_active
+                if absence > ABSENCE_TOLERANCE:
+                    duration = self.last_active - self.session_start
+                    if duration >= MIN_GAME_DURATION:
+                        start_dt = datetime.fromtimestamp(self.session_start)
+                        end_dt = datetime.fromtimestamp(self.last_active)
+                        save_session(self.table_id, start_dt, end_dt)
+                        print(f"[Table {self.table_id}] < Saved {int(duration)} sec", flush=True)
+                    else:
+                        print(f"[Table {self.table_id}] < Too short ({int(duration)} sec)", flush=True)
+                    self.session_start = None
+                    self.last_active = None
 
 
 def get_box_center(xyxy):
+    """Берём точку близко к НОГАМ — для гомографии важна точка касания пола."""
     x1, y1, x2, y2 = xyxy
-    return (int((x1 + x2) / 2), int((y1 + y2) / 2))
+    cx = int((x1 + x2) / 2)
+    cy = int(y1 + (y2 - y1) * 0.95)
+    return (cx, cy)
 
 
 def process_camera(camera, zones):
-    # Каждый поток создаёт свою модель — YOLO не thread-safe!
-    print(f"[{camera['name']}] Загрузка YOLO...", flush=True)
+    print(f"[{camera['name']}] Loading YOLO...", flush=True)
     model = YOLO('yolov8n.pt')
-    print(f"[{camera['name']}] Подключение...", flush=True)
+    print(f"[{camera['name']}] Connecting...", flush=True)
 
-    # Загружаем правила для столов
     table_rules = load_table_rules()
+    homographies = load_homographies()
+    H = homographies.get(camera['id'])
 
-    # Определяем размер кадра
+    if H is None:
+        print(f"[{camera['name']}] WARNING: no homography for this camera, working in pixel mode", flush=True)
+    else:
+        print(f"[{camera['name']}] Homography loaded", flush=True)
+
     cap_test = cv2.VideoCapture(camera['rtsp'], cv2.CAP_FFMPEG)
     frame_w, frame_h = 1920, 1080
     if cap_test.isOpened():
@@ -463,43 +462,38 @@ def process_camera(camera, zones):
         if ret:
             frame_h, frame_w = frame_test.shape[:2]
     cap_test.release()
-    print(f"[{camera['name']}] Разрешение: {frame_w}x{frame_h}", flush=True)
+    print(f"[{camera['name']}] Resolution: {frame_w}x{frame_h}", flush=True)
 
-    # Создаём трекеры для столов этой камеры
     table_trackers = {}
     for table_id_str, zone in zones.items():
         if zone.get('camera_id') == camera['id']:
             table_id = int(table_id_str)
             rules = get_rules_for_table(table_rules, table_id)
-            tracker = TableTracker(
-                table_id, zone['points'],
-                frame_w, frame_h, frame_w, frame_h,
-                rules
-            )
+            tracker = TableTracker(table_id, zone, H, rules)
             tracker.init_mask(frame_h, frame_w)
             table_trackers[table_id] = tracker
-            print(f"[{camera['name']}] Стол {table_id} правила: "
+            mode = 'homography' if tracker.use_homography else 'pixel'
+            print(f"[{camera['name']}] Table {table_id} ({mode}) "
                   f"min_stable={rules['min_stable_people']}, "
                   f"threshold={rules['score_threshold']}, "
-                  f"bonus={rules['score_bonus']}, "
-                  f"ignore_ball={rules['ignore_ball']}", flush=True)
+                  f"bonus={rules['score_bonus']}", flush=True)
 
     if not table_trackers:
-        print(f"[{camera['name']}] ⚠ Нет размеченных зон", flush=True)
+        print(f"[{camera['name']}] No zones marked", flush=True)
         return
 
-    print(f"[{camera['name']}] Столы: {sorted(table_trackers.keys())}", flush=True)
+    print(f"[{camera['name']}] Tables: {sorted(table_trackers.keys())}", flush=True)
 
     person_tracks = {}
 
     while True:
         cap = cv2.VideoCapture(camera['rtsp'], cv2.CAP_FFMPEG)
         if not cap.isOpened():
-            print(f"[{camera['name']}] Не удалось подключиться, повтор через 10 сек", flush=True)
+            print(f"[{camera['name']}] Cannot connect, retry in 10s", flush=True)
             time.sleep(10)
             continue
 
-        print(f"[{camera['name']}] ✅ Подключено", flush=True)
+        print(f"[{camera['name']}] Connected", flush=True)
         last_process_time = 0
         frame_count = 0
 
@@ -507,13 +501,27 @@ def process_camera(camera, zones):
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    print(f"[{camera['name']}] Поток прерван", flush=True)
+                    print(f"[{camera['name']}] Stream broken", flush=True)
                     break
 
                 if time.time() - last_process_time < FRAME_INTERVAL:
                     continue
                 last_process_time = time.time()
                 frame_count += 1
+
+                # Сохраняем снимок каждые 2 секунды
+                cam_id = camera['id']
+                now_snap = time.time()
+                if now_snap - last_snapshot_time.get(cam_id, 0) > 2:
+                    try:
+                        small = cv2.resize(frame, (960, 540))
+                        tmp = os.path.join(SNAPSHOTS_DIR, f'cam_{cam_id}_tmp.jpg')
+                        final = os.path.join(SNAPSHOTS_DIR, f'cam_{cam_id}.jpg')
+                        cv2.imwrite(tmp, small, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                        os.replace(tmp, final)
+                        last_snapshot_time[cam_id] = now_snap
+                    except Exception:
+                        pass
 
                 # YOLO детекция
                 try:
@@ -526,12 +534,11 @@ def process_camera(camera, zones):
                         verbose=False
                     )
                 except Exception as e:
-                    print(f"[{camera['name']}] Ошибка YOLO: {e}", flush=True)
+                    print(f"[{camera['name']}] YOLO error: {e}", flush=True)
                     continue
 
                 rackets = []
 
-                # Парсим результаты детекции
                 for r in results:
                     if r.boxes is None:
                         continue
@@ -550,7 +557,6 @@ def process_camera(camera, zones):
                                 person_tracks[track_id] = PersonTrack(track_id)
                             person_tracks[track_id].update(center)
 
-                # Удаляем мёртвые треки
                 dead = [tid for tid, t in person_tracks.items() if not t.is_alive()]
                 for tid in dead:
                     del person_tracks[tid]
@@ -558,11 +564,10 @@ def process_camera(camera, zones):
                 alive_count = len([t for t in person_tracks.values() if t.is_alive()])
 
                 if frame_count % 30 == 0:
-                    print(f"[{camera['name']}] Кадр #{frame_count} | "
-                          f"Людей: {alive_count} | Ракеток: {len(rackets)}", flush=True)
+                    print(f"[{camera['name']}] Frame #{frame_count} | "
+                          f"People: {alive_count} | Rackets: {len(rackets)}", flush=True)
 
-                # === ПРИВЯЗКА К БЛИЖАЙШЕМУ СТОЛУ ===
-                # Каждый человек привязан к ОДНОМУ столу — ближайшему к его позиции
+                # Привязка людей к ближайшему столу
                 table_persons = {tid: {} for tid in table_trackers}
 
                 for track_id, track in person_tracks.items():
@@ -575,9 +580,18 @@ def process_camera(camera, zones):
                     for tid, tracker in table_trackers.items():
                         if not tracker.point_in_expanded(pos):
                             continue
-                        center = tracker.zone_points.mean(axis=0)
-                        dx = pos[0] - center[0]
-                        dy = pos[1] - center[1]
+                        # Дистанция считается на ПОЛУ если есть гомография
+                        if tracker.use_homography:
+                            floor_pt = tracker.pixel_to_floor(pos)
+                            if floor_pt is None:
+                                continue
+                            center_floor = tracker.zone_floor.mean(axis=0)
+                            dx = floor_pt[0] - center_floor[0]
+                            dy = floor_pt[1] - center_floor[1]
+                        else:
+                            center = tracker.zone_pixel.mean(axis=0)
+                            dx = pos[0] - center[0]
+                            dy = pos[1] - center[1]
                         dist = (dx * dx + dy * dy) ** 0.5
                         if dist < best_dist:
                             best_dist = dist
@@ -586,7 +600,7 @@ def process_camera(camera, zones):
                     if best_table is not None:
                         table_persons[best_table][track_id] = track
 
-                # Ракетки тоже к ближайшему столу
+                # Ракетки к ближайшему столу
                 table_rackets = {tid: [] for tid in table_trackers}
                 for racket_pt in rackets:
                     best_table = None
@@ -594,9 +608,17 @@ def process_camera(camera, zones):
                     for tid, tracker in table_trackers.items():
                         if not tracker.point_in_expanded(racket_pt):
                             continue
-                        center = tracker.zone_points.mean(axis=0)
-                        dx = racket_pt[0] - center[0]
-                        dy = racket_pt[1] - center[1]
+                        if tracker.use_homography:
+                            floor_pt = tracker.pixel_to_floor(racket_pt)
+                            if floor_pt is None:
+                                continue
+                            center_floor = tracker.zone_floor.mean(axis=0)
+                            dx = floor_pt[0] - center_floor[0]
+                            dy = floor_pt[1] - center_floor[1]
+                        else:
+                            center = tracker.zone_pixel.mean(axis=0)
+                            dx = racket_pt[0] - center[0]
+                            dy = racket_pt[1] - center[1]
                         dist = (dx * dx + dy * dy) ** 0.5
                         if dist < best_dist:
                             best_dist = dist
@@ -604,7 +626,6 @@ def process_camera(camera, zones):
                     if best_table is not None:
                         table_rackets[best_table].append(racket_pt)
 
-                # === ОБСЧЁТ СТОЛОВ ===
                 for tid, tracker in table_trackers.items():
                     score = tracker.calculate_score(
                         table_persons[tid],
@@ -613,7 +634,6 @@ def process_camera(camera, zones):
                     )
                     tracker.update(score)
 
-                # Сохраняем активные сессии каждые 5 кадров
                 if frame_count % 5 == 0:
                     active = {}
                     for tid, tracker in table_trackers.items():
@@ -623,22 +643,23 @@ def process_camera(camera, zones):
 
         except Exception as e:
             import traceback
-            print(f"[{camera['name']}] Критическая ошибка: {e}", flush=True)
+            print(f"[{camera['name']}] Critical error: {e}", flush=True)
             traceback.print_exc()
             time.sleep(5)
         finally:
             cap.release()
 
+
 def main():
     init_db()
 
     if not os.path.exists(ZONES_FILE):
-        print("❌ Сначала разметьте столы: python backend/marker.py")
+        print("Mark tables first: python backend/marker_v2.py")
         return
 
     with open(ZONES_FILE, 'r') as f:
         zones = json.load(f)
-    print(f"Загружено зон: {len(zones)}")
+    print(f"Loaded zones: {len(zones)}")
 
     threads = []
     for camera in CAMERAS:
@@ -651,13 +672,13 @@ def main():
         threads.append(t)
         time.sleep(3)
 
-    print("\n🟢 Анализ запущен. Ctrl+C для остановки\n")
+    print("\nAnalysis running. Ctrl+C to stop\n")
 
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n🔴 Остановка...")
+        print("\nStopping...")
 
 
 if __name__ == "__main__":

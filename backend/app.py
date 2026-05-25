@@ -173,16 +173,42 @@ def index():
 @app.route('/api/stats/today')
 @login_required
 def stats_today():
+    import sqlite3
     stats = get_stats_for_date(date.today())
-    return jsonify(format_stats(stats))
+    db_path = os.path.join(DATA_DIR, 'stats.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT table_id,
+               SUM(CAST(strftime('%s', end_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER)) as total
+        FROM sessions
+        WHERE start_time >= date('now', '-7 days')
+        GROUP BY table_id
+    """)
+    week_raw = [{'table_id': r[0], 'total_seconds': r[1] or 0} for r in c.fetchall()]
+    conn.close()
+    return jsonify(format_stats(stats, week_raw))
 
 
 @app.route('/api/stats/date/<date_str>')
 @login_required
 def stats_by_date(date_str):
+    import sqlite3
     target = date.fromisoformat(date_str)
     stats = get_stats_for_date(target)
-    return jsonify(format_stats(stats))
+    db_path = os.path.join(DATA_DIR, 'stats.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT table_id,
+               SUM(CAST(strftime('%s', end_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER)) as total
+        FROM sessions
+        WHERE start_time >= date(?, '-7 days') AND start_time <= date(?, '+1 days')
+        GROUP BY table_id
+    """, (date_str, date_str))
+    week_raw = [{'table_id': r[0], 'total_seconds': r[1] or 0} for r in c.fetchall()]
+    conn.close()
+    return jsonify(format_stats(stats, week_raw))
 
 
 @app.route('/api/stats/range')
@@ -214,13 +240,26 @@ def stats_live():
         pass
     return jsonify(result)
 
+@app.route('/api/cameras/<int:cam_id>/snapshot')
+@login_required
+def camera_snapshot(cam_id):
+    snapshots_dir = os.path.join(DATA_DIR, 'snapshots')
+    filename = f'cam_{cam_id}.jpg'
+    path = os.path.join(snapshots_dir, filename)
+    if not os.path.exists(path):
+        return '', 404
+    response = send_from_directory(snapshots_dir, filename)
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
-def format_stats(stats):
+
+def format_stats(stats, week_stats=None):
     all_tables = []
     for camera in CAMERAS:
         all_tables.extend(camera['tables'])
 
     stats_dict = {row['table_id']: row for row in stats}
+    week_dict = {row['table_id']: row for row in (week_stats or [])}
 
     result = []
     for table_id in sorted(all_tables):
@@ -231,6 +270,8 @@ def format_stats(stats):
             total = 0
             sessions = 0
 
+        week_total = week_dict.get(table_id, {}).get('total_seconds', 0)
+
         hours = total // 3600
         minutes = (total % 3600) // 60
         result.append({
@@ -238,12 +279,71 @@ def format_stats(stats):
             "hours": hours,
             "minutes": minutes,
             "total_seconds": total,
+            "week_seconds": week_total,
             "sessions": sessions,
             "formatted": f"{hours}ч {minutes}мин"
         })
 
     return result
 
+@app.route('/api/stats/week')
+@login_required
+def stats_week():
+    import sqlite3
+    db_path = os.path.join(DATA_DIR, 'stats.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT date(start_time) as d,
+               SUM(CAST(strftime('%s', end_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER)) as total
+        FROM sessions
+        WHERE start_time >= date('now', '-7 days')
+        GROUP BY d ORDER BY d
+    """)
+    result = [{"date": row[0], "total_seconds": row[1] or 0} for row in c.fetchall()]
+    conn.close()
+    return jsonify(result)
+
+
+@app.route('/api/stats/hourly')
+@login_required
+def stats_hourly():
+    import sqlite3
+    date_str = request.args.get('date') or date.today().isoformat()
+    db_path = os.path.join(DATA_DIR, 'stats.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT CAST(strftime('%H', start_time) AS INTEGER) as h,
+               SUM(CAST(strftime('%s', end_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER)) as total
+        FROM sessions
+        WHERE date(start_time) = ?
+        GROUP BY h
+    """, (date_str,))
+    by_hour = {row[0]: row[1] for row in c.fetchall()}
+    result = [{"hour": h, "total_seconds": by_hour.get(h, 0)} for h in range(8, 23)]
+    conn.close()
+    return jsonify(result)
+
+
+@app.route('/api/stats/weekly')
+@login_required
+def stats_weekly():
+    import sqlite3
+    db_path = os.path.join(DATA_DIR, 'stats.db')
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT ((CAST(strftime('%w', start_time) AS INTEGER) + 6) % 7) as wd,
+               SUM(CAST(strftime('%s', end_time) AS INTEGER) - CAST(strftime('%s', start_time) AS INTEGER)) as total
+        FROM sessions
+        WHERE start_time >= date('now', '-7 days')
+        GROUP BY wd
+    """)
+    by_day = {row[0]: row[1] for row in c.fetchall()}
+    result = [{"weekday": d, "total_seconds": by_day.get(d, 0)} for d in range(7)]
+    conn.close()
+    return jsonify(result)
 
 if __name__ == "__main__":
     init_db()
