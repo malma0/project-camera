@@ -1,685 +1,1014 @@
-import cv2
+"""
+analyzer.py — детектор занятости столов (v3, переписано с нуля).
+
+Архитектура:
+  • 2 RTSP-потока, каждый в своём CaptureThread (drop-old-keep-newest).
+  • Каждые ~0.5 сек на каждой камере делается tick:
+        - YOLO11s (OpenVINO INT8) ищет людей
+        - MOG2 даёт маску движения
+        - для каждого стола камеры считается "сигнал занятости" этого тика
+  • Сигналы складываются в скользящее окно 60 с на каждый стол.
+  • Решение start/stop сессии — гистерезисное, с асимметричными порогами
+    (FP дороже FN: высокий порог входа, низкий выхода, в сомнении — пусто).
+  • Сессии пишутся в SQLite, активные — в data/active.json (для дашборда).
+  • После 22:05 (свет в зале выключают) все сессии принудительно закрываются,
+    новые не открываются до утра.
+
+Контракт с дашбордом (app.py) — НЕ менять:
+  • data/active.json формата {"<table_id>": {"start": <unix_ts>}, ...}
+  • data/snapshots/cam_<id>.jpg — JPEG последний кадр камеры
+  • таблица sessions(table_id, start_time, end_time, duration_seconds),
+    timestamps формата 'YYYY-MM-DD HH:MM:SS.ffffff'.
+"""
+
+import os
+import sys
 import json
 import time
+import math
+import sqlite3
 import threading
-import numpy as np
-from datetime import datetime
+import logging
 from collections import deque
-from ultralytics import YOLO
-import sys, os
+from datetime import datetime, time as dtime
 
-TABLE_RULES_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "table_rules.json"
+import cv2
+import numpy as np
+
+# Проектные модули
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import CAMERAS  # список словарей: {id, name, rtsp, tables: [id,...]}
+
+# ------------------------------------------------------------------ #
+#  ПУТИ И КОНСТАНТЫ
+# ------------------------------------------------------------------ #
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR     = os.path.join(PROJECT_ROOT, 'data')
+SNAP_DIR     = os.path.join(DATA_DIR, 'snapshots')
+ZONES_FILE   = os.path.join(DATA_DIR, 'zones.json')
+HOMOG_FILE   = os.path.join(DATA_DIR, 'homography.json')
+RULES_FILE   = os.path.join(DATA_DIR, 'table_rules.json')
+ACTIVE_FILE  = os.path.join(DATA_DIR, 'active.json')
+DB_FILE      = os.path.join(DATA_DIR, 'stats.db')
+
+# Модели — пытаемся OpenVINO INT8, потом FP32, потом PyTorch
+MODEL_DIR        = os.path.join(PROJECT_ROOT, 'models')
+MODEL_INT8_PATH  = os.path.join(MODEL_DIR, 'yolo11s_int8_openvino_model')
+MODEL_FP32_PATH  = os.path.join(MODEL_DIR, 'yolo11s_openvino_model')
+MODEL_PT_PATH    = os.path.join(MODEL_DIR, 'yolo11s.pt')
+
+# Класс "person" в COCO
+PERSON_CLASS_ID  = 0
+
+# Геометрия стола (мм) и асимметричное расширение зоны "у стола"
+TABLE_LENGTH_MM  = 2740       # длинная сторона, ось far↔near
+TABLE_WIDTH_MM   = 1525       # короткая сторона (торец где подают), ось left↔right
+EXPAND_LONG_MM   = 800        # расширение за торцы (направление far↔near) — где стоят игроки
+EXPAND_SHORT_MM  = 300        # расширение в стороны (направление left↔right) — мало, чтоб не цеплять соседей
+
+# Тайминг
+TICK_INTERVAL_S        = 0.5      # как часто анализируем (2 fps на каждую камеру)
+WINDOW_SECONDS         = 60       # скользящее окно агрегации сигналов на стол
+WINDOW_SIZE            = int(WINDOW_SECONDS / TICK_INTERVAL_S)  # 120 тиков
+
+# Гистерезис: доля "занятых" тиков в окне для входа/выхода.
+# В пустом окне ratio = 0. В полностью занятом = 1.
+START_RATIO            = 0.65     # ≥65% подтверждений за 60с → старт
+STOP_RATIO             = 0.20     # <20% подтверждений за 60с → стоп
+# Между ними — состояние сохраняется (это и есть гистерезис).
+
+# Минимальная длина сессии, иначе не пишем в БД (отсекаем артефакты)
+MIN_SESSION_SECONDS    = 60
+
+# YOLO
+YOLO_CONF              = 0.35     # порог уверенности детектора людей
+YOLO_IMGSZ             = 640
+
+# Свет выключают в этот момент — после этого сессии закрываются принудительно
+LIGHTS_OFF             = dtime(22, 5)
+LIGHTS_ON              = dtime(7, 0)   # утром раньше этого не открываем
+
+# MOG2
+MOG2_HISTORY           = 500
+MOG2_VAR_THRESHOLD     = 24
+MOG2_LEARNING_RATE     = -1       # авто
+# Доля движущихся пикселей в маске стола, ниже которой считаем что движения нет
+MOTION_RATIO_THRESHOLD = 0.015    # 1.5% площади маски стола
+# Фильтр blob'ов сетки: слишком тонкие/длинные регионы выбрасываем
+NET_MAX_ASPECT_RATIO   = 6.0      # h/w > 6 → скорее всего сетка, не игрок
+
+# Снапшоты для дашборда — чаще обновляем для плавности
+SNAPSHOT_EVERY_S       = 2
+
+# Evidence-снимки для доказательной базы:
+# Сохраняются только в рабочее время (между EVIDENCE_HOUR_START и EVIDENCE_HOUR_END).
+# Хранятся EVIDENCE_KEEP_DAYS дней.
+EVIDENCE_DIR           = os.path.join(DATA_DIR, 'evidence')
+EVIDENCE_INTERVAL_S    = 15 * 60    # 15 минут
+EVIDENCE_KEEP_DAYS     = 90
+EVIDENCE_HOUR_START    = 10   # с 10:00
+EVIDENCE_HOUR_END      = 22   # до 22:00
+
+# Склейка сессий: если STOP и следующий START для одного стола разделены
+# менее чем SESSION_MERGE_GRACE_S секунд — считаем их одной непрерывной сессией.
+# Игрок отошёл попить, шарики собрать, поговорить — это не конец сессии.
+# ВАЖНО: пауза между уходом и возвращением в БД НЕ идёт. duration_seconds =
+# (время до отхода) + (время после возвращения). end_time - start_time будет
+# больше чем duration_seconds — это значит был перерыв, и он не в счёт.
+SESSION_MERGE_GRACE_S  = 4 * 60   # 4 минуты
+
+# Калибровочный датасет для OpenVINO INT8 квантизации.
+# Включается переменной окружения COLLECT_CALIBRATION=1.
+# Сохраняет каждый Nth тик в data/calibration_dataset/cam{id}_{ts}.jpg.
+# Цель: 200-300 разнообразных кадров за час пик с обеих камер.
+COLLECT_CALIBRATION    = os.environ.get('COLLECT_CALIBRATION', '0') == '1'
+CALIB_DIR              = os.path.join(DATA_DIR, 'calibration_dataset')
+CALIB_EVERY_N_TICKS    = 5   # каждый 5-й тик при 2 fps = 1 кадр / 2.5 сек / камера
+CALIB_MAX_FILES        = 800 # увеличено: ~400 на камеру
+CALIB_MAX_PER_CAM      = 400 # максимум на одну камеру
+
+# Диагностический лог: для столов из DEBUG_TABLES (env, через запятую) каждые
+# DEBUG_LOG_EVERY_N_TICKS тиков пишет в лог: сколько людей в зоне, motion,
+# текущее значение скользящего окна. Для отладки конкретного стола.
+# Пример: DEBUG_TABLES=11
+_debug_env = os.environ.get('DEBUG_TABLES', '').strip()
+DEBUG_TABLES_SET = set(int(x) for x in _debug_env.split(',') if x.strip().isdigit())
+DEBUG_LOG_EVERY_N_TICKS = 20  # при tick=0.5s это раз в 10 секунд
+
+# ------------------------------------------------------------------ #
+#  ЛОГИРОВАНИЕ
+# ------------------------------------------------------------------ #
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%H:%M:%S',
 )
+log = logging.getLogger('analyzer')
 
-HOMOGRAPHY_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "homography.json"
-)
+# ------------------------------------------------------------------ #
+#  ЗАГРУЗКА КОНФИГОВ
+# ------------------------------------------------------------------ #
 
-
-def load_table_rules():
-    if not os.path.exists(TABLE_RULES_FILE):
-        return {"default": {}}
-    with open(TABLE_RULES_FILE, 'r', encoding='utf-8') as f:
+def load_zones():
+    with open(ZONES_FILE, 'r') as f:
         return json.load(f)
 
-
-def get_rules_for_table(all_rules, table_id):
-    default = all_rules.get("default", {})
-    specific = all_rules.get(str(table_id), {})
-    merged = {**default, **specific}
-    merged.setdefault("min_stable_people", 2)
-    merged.setdefault("score_threshold", 6)
-    merged.setdefault("exit_threshold", 4)
-    merged.setdefault("score_bonus", 0)
-    merged.setdefault("ignore_ball", False)
-    merged.setdefault("require_movement", True)
-    return merged
-
-
 def load_homographies():
-    """Загружает матрицы гомографии {camera_id: np.array 3x3}."""
-    if not os.path.exists(HOMOGRAPHY_FILE):
-        print("[WARN] homography.json not found - run marker_v2.py first!", flush=True)
-        return {}
-    with open(HOMOGRAPHY_FILE, 'r') as f:
+    """Возвращает {camera_id (int): {'H': matrix px→floor, 'H_inv': matrix floor→px}}."""
+    with open(HOMOG_FILE, 'r') as f:
         raw = json.load(f)
-    return {int(k): np.array(v, dtype=np.float32) for k, v in raw.items()}
-
-
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
-
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import (
-    CAMERAS, ZONES_FILE, FRAME_INTERVAL, STABLE_DURATION, TRACK_BUFFER,
-    SCORE_THRESHOLD, CONFIRMATION_SECONDS, ABSENCE_TOLERANCE, MIN_GAME_DURATION,
-    MOVEMENT_HISTORY, MOVEMENT_THRESHOLD_HIGH, DETECTION_CONFIDENCE, TABLE_EXPAND_PX
-)
-from database import init_db, save_session
-
-CLASS_PERSON = 0
-CLASS_RACKET = 38
-
-MOVEMENT_THRESHOLD_LOW = 5
-
-# Расширение зоны стола НА ПОЛУ в миллиметрах
-# Игроки стоят примерно в 80-100 см от края стола
-FLOOR_EXPAND_MM = 1000
-
-ACTIVE_FILE = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "active.json"
-)
-
-SNAPSHOTS_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "data", "snapshots"
-)
-os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-
-snapshot_lock = threading.Lock()
-last_snapshot_time = {}
-
-active_sessions_lock = threading.Lock()
-
-
-def save_active_sessions(camera_id, sessions):
-    try:
-        with active_sessions_lock:
-            existing = {}
-            if os.path.exists(ACTIVE_FILE):
-                try:
-                    with open(ACTIVE_FILE, 'r') as f:
-                        existing = json.load(f)
-                except:
-                    existing = {}
-
-            keys_to_remove = [k for k, v in existing.items()
-                              if v.get('camera_id') == camera_id]
-            for k in keys_to_remove:
-                del existing[k]
-
-            for table_id, start_ts in sessions.items():
-                existing[str(table_id)] = {
-                    'start': start_ts,
-                    'camera_id': camera_id
-                }
-
-            with open(ACTIVE_FILE, 'w') as f:
-                json.dump(existing, f)
-    except Exception as e:
-        print(f"[ERROR] save active.json: {e}", flush=True)
-
-
-def detect_ball_on_table(frame, zone_mask, prev_frame=None):
-    balls = []
-    try:
-        masked = cv2.bitwise_and(frame, frame, mask=zone_mask)
-        hsv = cv2.cvtColor(masked, cv2.COLOR_BGR2HSV)
-
-        lower_white = np.array([0, 0, 180])
-        upper_white = np.array([180, 60, 255])
-        white_mask = cv2.inRange(hsv, lower_white, upper_white)
-
-        lower_orange = np.array([10, 100, 150])
-        upper_orange = np.array([30, 255, 255])
-        orange_mask = cv2.inRange(hsv, lower_orange, upper_orange)
-
-        ball_mask = cv2.bitwise_or(white_mask, orange_mask)
-
-        kernel = np.ones((3, 3), np.uint8)
-        ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_OPEN, kernel)
-        ball_mask = cv2.morphologyEx(ball_mask, cv2.MORPH_CLOSE, kernel)
-
-        contours, _ = cv2.findContours(ball_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < 20 or area > 800:
-                continue
-
-            perimeter = cv2.arcLength(cnt, True)
-            if perimeter == 0:
-                continue
-            circularity = 4 * np.pi * area / (perimeter ** 2)
-            if circularity < 0.4:
-                continue
-
-            M = cv2.moments(cnt)
-            if M["m00"] == 0:
-                continue
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            balls.append((cx, cy))
-
-    except Exception:
-        pass
-
-    return balls
-
-
-class BallTracker:
-    def __init__(self):
-        self.positions = deque(maxlen=10)
-        self.last_seen = None
-
-    def update(self, balls):
-        if not balls:
-            return False
-
-        pos = balls[0]
-        now = time.time()
-
-        if self.last_seen and (now - self.last_seen) > 3:
-            self.positions.clear()
-
-        self.positions.append(pos)
-        self.last_seen = now
-
-        if len(self.positions) >= 3:
-            dx = self.positions[-1][0] - self.positions[-3][0]
-            dy = self.positions[-1][1] - self.positions[-3][1]
-            dist = (dx*dx + dy*dy) ** 0.5
-            return dist > 15
-        return False
-
-    def is_active(self):
-        if self.last_seen is None:
-            return False
-        return (time.time() - self.last_seen) < 2
-
-
-class PersonTrack:
-    def __init__(self, track_id):
-        self.id = track_id
-        self.first_seen = time.time()
-        self.last_seen = time.time()
-        self.positions = deque(maxlen=MOVEMENT_HISTORY)
-
-    def update(self, center):
-        self.last_seen = time.time()
-        self.positions.append(center)
-
-    def is_stable(self):
-        return (self.last_seen - self.first_seen) >= STABLE_DURATION
-
-    def is_alive(self):
-        return (time.time() - self.last_seen) < TRACK_BUFFER
-
-    def movement_intensity(self):
-        if len(self.positions) < 2:
-            return 0
-        distances = []
-        for i in range(1, len(self.positions)):
-            dx = self.positions[i][0] - self.positions[i-1][0]
-            dy = self.positions[i][1] - self.positions[i-1][1]
-            distances.append((dx*dx + dy*dy) ** 0.5)
-        return sum(distances) / len(distances) if distances else 0
-
-
-class TableTracker:
-    """Трекер стола с поддержкой гомографии.
-    Зоны хранятся в координатах ПОЛА (миллиметры).
-    Точки игроков переводятся в координаты пола через гомографию."""
-
-    def __init__(self, table_id, zone_data, homography, rules):
-        self.table_id = table_id
-        self.rules = rules
-        self.homography = homography
-
-        # Зона на полу (миллиметры)
-        floor_pts = zone_data.get('points_floor')
-        pixel_pts = zone_data.get('points_pixel') or zone_data.get('points')
-
-        if floor_pts is not None and homography is not None:
-            self.zone_floor = np.array(floor_pts, dtype=np.float32)
-            self.expanded_floor = self._expand_floor_zone(self.zone_floor, FLOOR_EXPAND_MM)
-            self.use_homography = True
-        else:
-            self.zone_floor = None
-            self.expanded_floor = None
-            self.use_homography = False
-
-        # Зона в пикселях — нужна для маски детектора мяча
-        self.zone_pixel = np.array(pixel_pts, np.int32)
-
-        # Расширенная пиксельная зона (fallback если нет гомографии)
-        self.expanded_pixel = self._expand_pixel_zone(pixel_pts, TABLE_EXPAND_PX)
-
-        self.zone_mask = None
-        self.session_start = None
-        self.last_active = None
-        self.pending_confirmations = 0
-        self.ball_tracker = BallTracker()
-
-    def init_mask(self, frame_h, frame_w):
-        self.zone_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
-        cv2.fillPoly(self.zone_mask, [self.zone_pixel], 255)
-
-    def _expand_floor_zone(self, points, padding_mm):
-        pts = np.array(points, dtype=np.float32)
-        center = pts.mean(axis=0)
-        expanded = []
-        for pt in pts:
-            direction = pt - center
-            length = np.linalg.norm(direction)
-            if length > 0:
-                unit = direction / length
-                expanded.append((pt + unit * padding_mm).tolist())
-            else:
-                expanded.append(pt.tolist())
-        return np.array(expanded, dtype=np.float32)
-
-    def _expand_pixel_zone(self, points, padding_px):
-        pts = np.array(points, np.float32)
-        center = pts.mean(axis=0)
-        expanded = []
-        for pt in pts:
-            direction = pt - center
-            length = np.linalg.norm(direction)
-            if length > 0:
-                unit = direction / length
-                expanded.append((pt + unit * padding_px).astype(int).tolist())
-            else:
-                expanded.append(pt.astype(int).tolist())
-        return np.array(expanded, np.int32)
-
-    def pixel_to_floor(self, point):
-        if self.homography is None:
-            return None
-        src = np.array([[[float(point[0]), float(point[1])]]], dtype=np.float32)
-        dst = cv2.perspectiveTransform(src, self.homography)
-        return (float(dst[0][0][0]), float(dst[0][0][1]))
-
-    def point_in_expanded(self, point):
-        """Главная проверка — попадает ли точка в зону стола.
-        Если есть гомография — проверяем на полу. Иначе — на картинке."""
-        if self.use_homography:
-            floor_pt = self.pixel_to_floor(point)
-            if floor_pt is None:
-                return False
-            return cv2.pointPolygonTest(self.expanded_floor,
-                                        (float(floor_pt[0]), float(floor_pt[1])), False) >= 0
-        else:
-            return cv2.pointPolygonTest(self.expanded_pixel,
-                                        (float(point[0]), float(point[1])), False) >= 0
-
-    @property
-    def zone_points(self):
-        """Для обратной совместимости с кодом process_camera (для расчёта центра)."""
-        return self.zone_pixel
-
-    def calculate_score(self, all_tracks, rackets, frame=None):
-        nearby_tracks = []
-        stable_count = 0
-        moving_count = 0
-        max_movement = 0
-        max_stable_duration = 0
-
-        for track in all_tracks.values():
-            if not track.is_alive() or not track.positions:
-                continue
-            last_pos = track.positions[-1]
-            if self.point_in_expanded(last_pos):
-                nearby_tracks.append(track)
-                intensity = track.movement_intensity()
-                max_movement = max(max_movement, intensity)
-
-                if track.is_stable():
-                    stable_count += 1
-                    duration = track.last_seen - track.first_seen
-                    max_stable_duration = max(max_stable_duration, duration)
-
-                if intensity > MOVEMENT_THRESHOLD_LOW:
-                    moving_count += 1
-
-        rackets_near = sum(1 for r in rackets if self.point_in_expanded(r))
-
-        if self.session_start is None and stable_count < self.rules["min_stable_people"]:
-            if len(nearby_tracks) > 0:
-                print(f"  [Table {self.table_id}] start filter: "
-                      f"stable {stable_count} < {self.rules['min_stable_people']}", flush=True)
-            return 0
-
-        racket_near_stable = False
-        for racket_pt in rackets:
-            if not self.point_in_expanded(racket_pt):
-                continue
-            for track in nearby_tracks:
-                if not track.is_stable() or not track.positions:
-                    continue
-                last_pos = track.positions[-1]
-                dist = ((racket_pt[0]-last_pos[0])**2 + (racket_pt[1]-last_pos[1])**2) ** 0.5
-                if dist < 200:
-                    racket_near_stable = True
-                    break
-
-        ball_moving = False
-        if frame is not None and self.zone_mask is not None:
-            balls = detect_ball_on_table(frame, self.zone_mask)
-            ball_moving = self.ball_tracker.update(balls)
-
-        score = 0
-
-        if stable_count >= 2:
-            score += 5
-        elif stable_count == 1:
-            score += 2
-
-        if moving_count >= 2:
-            score += 4
-        elif moving_count == 1:
-            score += 2
-
-        if racket_near_stable:
-            score += 4
-        elif rackets_near > 0:
-            score += 2
-
-        if max_movement > MOVEMENT_THRESHOLD_HIGH:
-            score += 2
-
-        if max_stable_duration > 60:
-            score += 2
-
-        if len(nearby_tracks) >= 2:
-            score += 1
-
-        if not self.rules["ignore_ball"] and ball_moving and len(nearby_tracks) >= 1:
-            score += 5
-            print(f"  [Table {self.table_id}] BALL MOVING +5", flush=True)
-
-        score += self.rules["score_bonus"]
-
-        if len(nearby_tracks) > 0 or rackets_near > 0 or ball_moving:
-            print(f"  [Table {self.table_id}] near={len(nearby_tracks)} "
-                  f"stable={stable_count} moving={moving_count} "
-                  f"ball={'y' if ball_moving else 'n'} "
-                  f"rackets={rackets_near} mov={int(max_movement)} "
-                  f"score={score}", flush=True)
-
-        return score
-
-    def update(self, score):
-        now = time.time()
-
-        if self.session_start is None:
-            is_active = score >= self.rules["score_threshold"]
-        else:
-            is_active = score >= self.rules["exit_threshold"]
-
-        if is_active:
-            self.pending_confirmations += 1
-            if self.pending_confirmations >= CONFIRMATION_SECONDS and self.session_start is None:
-                self.session_start = now - (CONFIRMATION_SECONDS * FRAME_INTERVAL)
-                print(f"[Table {self.table_id}] > Session started (score={score})", flush=True)
-            self.last_active = now
-        else:
-            self.pending_confirmations = 0
-            if self.session_start is not None and self.last_active is not None:
-                absence = now - self.last_active
-                if absence > ABSENCE_TOLERANCE:
-                    duration = self.last_active - self.session_start
-                    if duration >= MIN_GAME_DURATION:
-                        start_dt = datetime.fromtimestamp(self.session_start)
-                        end_dt = datetime.fromtimestamp(self.last_active)
-                        save_session(self.table_id, start_dt, end_dt)
-                        print(f"[Table {self.table_id}] < Saved {int(duration)} sec", flush=True)
-                    else:
-                        print(f"[Table {self.table_id}] < Too short ({int(duration)} sec)", flush=True)
-                    self.session_start = None
-                    self.last_active = None
-
-
-def get_box_center(xyxy):
-    """Берём точку близко к НОГАМ — для гомографии важна точка касания пола."""
-    x1, y1, x2, y2 = xyxy
-    cx = int((x1 + x2) / 2)
-    cy = int(y1 + (y2 - y1) * 0.95)
-    return (cx, cy)
-
-
-def process_camera(camera, zones):
-    print(f"[{camera['name']}] Loading YOLO...", flush=True)
-    model = YOLO('yolov8n.pt')
-    print(f"[{camera['name']}] Connecting...", flush=True)
-
-    table_rules = load_table_rules()
-    homographies = load_homographies()
-    H = homographies.get(camera['id'])
-
-    if H is None:
-        print(f"[{camera['name']}] WARNING: no homography for this camera, working in pixel mode", flush=True)
-    else:
-        print(f"[{camera['name']}] Homography loaded", flush=True)
-
-    cap_test = cv2.VideoCapture(camera['rtsp'], cv2.CAP_FFMPEG)
-    frame_w, frame_h = 1920, 1080
-    if cap_test.isOpened():
-        ret, frame_test = cap_test.read()
-        if ret:
-            frame_h, frame_w = frame_test.shape[:2]
-    cap_test.release()
-    print(f"[{camera['name']}] Resolution: {frame_w}x{frame_h}", flush=True)
-
-    table_trackers = {}
-    for table_id_str, zone in zones.items():
-        if zone.get('camera_id') == camera['id']:
-            table_id = int(table_id_str)
-            rules = get_rules_for_table(table_rules, table_id)
-            tracker = TableTracker(table_id, zone, H, rules)
-            tracker.init_mask(frame_h, frame_w)
-            table_trackers[table_id] = tracker
-            mode = 'homography' if tracker.use_homography else 'pixel'
-            print(f"[{camera['name']}] Table {table_id} ({mode}) "
-                  f"min_stable={rules['min_stable_people']}, "
-                  f"threshold={rules['score_threshold']}, "
-                  f"bonus={rules['score_bonus']}", flush=True)
-
-    if not table_trackers:
-        print(f"[{camera['name']}] No zones marked", flush=True)
-        return
-
-    print(f"[{camera['name']}] Tables: {sorted(table_trackers.keys())}", flush=True)
-
-    person_tracks = {}
-
-    while True:
-        cap = cv2.VideoCapture(camera['rtsp'], cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            print(f"[{camera['name']}] Cannot connect, retry in 10s", flush=True)
-            time.sleep(10)
+    out = {}
+    for cam_id_str, H_list in raw.items():
+        H = np.array(H_list, dtype=np.float64)
+        H_inv = np.linalg.inv(H)
+        out[int(cam_id_str)] = {'H': H, 'H_inv': H_inv}
+    return out
+
+def load_rules():
+    """Объединяет default-правила с per-table override'ами.
+    Игнорирует ключи начинающиеся на '_' (комментарии) и ключи которые не int."""
+    with open(RULES_FILE, 'r') as f:
+        raw = json.load(f)
+    default = raw.get('default', {})
+    # выкидываем из default служебные ключи если затесались
+    default = {k: v for k, v in default.items() if not k.startswith('_')}
+    rules = {}
+    for k, v in raw.items():
+        if k == 'default' or k.startswith('_'):
             continue
-
-        print(f"[{camera['name']}] Connected", flush=True)
-        last_process_time = 0
-        frame_count = 0
-
         try:
-            while True:
+            tid = int(k)
+        except ValueError:
+            log.warning(f'Skipping non-integer rule key: {k!r}')
+            continue
+        merged = dict(default)
+        merged.update({kk: vv for kk, vv in v.items() if not kk.startswith('_')})
+        rules[tid] = merged
+    return default, rules
+
+def rule_for(table_id, default, rules):
+    return rules.get(int(table_id), dict(default))
+
+# ------------------------------------------------------------------ #
+#  ГЕОМЕТРИЯ: расширение зоны стола в координатах пола
+# ------------------------------------------------------------------ #
+
+def expand_floor_polygon(points_floor):
+    """
+    Расширяет 4-угольник стола асимметрично:
+      • +EXPAND_LONG_MM по длинной оси (far↔near, где стоят игроки)
+      • +EXPAND_SHORT_MM по короткой оси (left↔right, бока стола)
+
+    Вход — список из 4 точек [far-left, far-right, near-right, near-left] в мм.
+    Алгоритм:
+      1. Центр стола = среднее 4 точек.
+      2. Локальные оси:
+         long_axis  = (near_mid - far_mid) нормированный  (вдоль длинной стороны)
+         short_axis = (right_mid - left_mid) нормированный (вдоль короткой стороны)
+      3. Сдвигаем каждый угол вдоль обеих осей в "наружном" направлении.
+
+    Это устойчиво к произвольной ориентации стола в координатах пола
+    (столы 12 и 1 у вас стоят зеркально/повёрнуто, см. zones.json).
+    """
+    pts = np.array(points_floor, dtype=np.float64)
+    fl, fr, nr, nl = pts[0], pts[1], pts[2], pts[3]
+
+    far_mid   = (fl + fr) / 2.0
+    near_mid  = (nl + nr) / 2.0
+    left_mid  = (fl + nl) / 2.0
+    right_mid = (fr + nr) / 2.0
+
+    long_vec  = near_mid - far_mid          # far → near
+    short_vec = right_mid - left_mid        # left → right
+
+    long_norm  = long_vec  / (np.linalg.norm(long_vec)  + 1e-9)
+    short_norm = short_vec / (np.linalg.norm(short_vec) + 1e-9)
+
+    # Для каждого угла: его смещение от центра разложим по long/short и
+    # сдвинем "от центра" вдоль каждой оси на соответствующий expand.
+    center = pts.mean(axis=0)
+    expanded = []
+    for p in pts:
+        v = p - center
+        # знак вдоль каждой оси (далеко/близко, влево/вправо)
+        s_long  = np.sign(np.dot(v, long_norm))
+        s_short = np.sign(np.dot(v, short_norm))
+        if s_long  == 0: s_long  = 1
+        if s_short == 0: s_short = 1
+        expanded.append(p
+                        + s_long  * EXPAND_LONG_MM  * long_norm
+                        + s_short * EXPAND_SHORT_MM * short_norm)
+    return np.array(expanded, dtype=np.float64)
+
+def floor_polygon_to_pixels(floor_pts, H_inv):
+    """Перевод точек пола (мм) → пиксели через обратную гомографию."""
+    src = floor_pts.astype(np.float32).reshape(-1, 1, 2)
+    dst = cv2.perspectiveTransform(src, H_inv.astype(np.float32))
+    return dst.reshape(-1, 2)
+
+def point_in_polygon(point_xy, polygon_pts):
+    """polygon_pts: ndarray (N,2). Возвращает True если внутри/на границе."""
+    poly = polygon_pts.astype(np.float32)
+    res = cv2.pointPolygonTest(poly, (float(point_xy[0]), float(point_xy[1])), False)
+    return res >= 0
+
+def pixel_to_floor(point_px, H):
+    """Один пиксель → пол."""
+    src = np.array([[[point_px[0], point_px[1]]]], dtype=np.float32)
+    dst = cv2.perspectiveTransform(src, H.astype(np.float32))
+    return (float(dst[0][0][0]), float(dst[0][0][1]))
+
+# ------------------------------------------------------------------ #
+#  ЗАХВАТ RTSP
+# ------------------------------------------------------------------ #
+
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+
+class RTSPCapture(threading.Thread):
+    """
+    Читает RTSP в отдельном потоке, всегда отдаёт ПОСЛЕДНИЙ кадр
+    (drop-old-keep-newest, чтобы анализатор не отставал от реального времени).
+    Автоматический reconnect при обрыве.
+    """
+    def __init__(self, camera_id, rtsp_url):
+        super().__init__(daemon=True, name=f'cap-{camera_id}')
+        self.camera_id = camera_id
+        self.rtsp_url  = rtsp_url
+        self._lock     = threading.Lock()
+        self._frame    = None
+        self._frame_ts = 0.0
+        self._stop     = threading.Event()
+
+    def run(self):
+        log.info(f'[cam {self.camera_id}] capture starting')
+        backoff = 1.0
+        while not self._stop.is_set():
+            cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                log.warning(f'[cam {self.camera_id}] open failed, retry in {backoff:.0f}s')
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                continue
+            backoff = 1.0
+            log.info(f'[cam {self.camera_id}] connected')
+            while not self._stop.is_set():
                 ret, frame = cap.read()
-                if not ret:
-                    print(f"[{camera['name']}] Stream broken", flush=True)
+                if not ret or frame is None:
+                    log.warning(f'[cam {self.camera_id}] read failed, reconnecting')
                     break
-
-                if time.time() - last_process_time < FRAME_INTERVAL:
-                    continue
-                last_process_time = time.time()
-                frame_count += 1
-
-                # Сохраняем снимок каждые 2 секунды
-                cam_id = camera['id']
-                now_snap = time.time()
-                if now_snap - last_snapshot_time.get(cam_id, 0) > 2:
-                    try:
-                        small = cv2.resize(frame, (960, 540))
-                        tmp = os.path.join(SNAPSHOTS_DIR, f'cam_{cam_id}_tmp.jpg')
-                        final = os.path.join(SNAPSHOTS_DIR, f'cam_{cam_id}.jpg')
-                        cv2.imwrite(tmp, small, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                        os.replace(tmp, final)
-                        last_snapshot_time[cam_id] = now_snap
-                    except Exception:
-                        pass
-
-                # YOLO детекция
-                try:
-                    results = model.track(
-                        frame,
-                        classes=[CLASS_PERSON, CLASS_RACKET],
-                        persist=True,
-                        tracker="bytetrack.yaml",
-                        conf=DETECTION_CONFIDENCE,
-                        verbose=False
-                    )
-                except Exception as e:
-                    print(f"[{camera['name']}] YOLO error: {e}", flush=True)
-                    continue
-
-                rackets = []
-
-                for r in results:
-                    if r.boxes is None:
-                        continue
-                    for box in r.boxes:
-                        cls = int(box.cls[0])
-                        xyxy = box.xyxy[0].tolist()
-                        center = get_box_center(xyxy)
-
-                        if cls == CLASS_RACKET:
-                            rackets.append(center)
-                        elif cls == CLASS_PERSON:
-                            if box.id is None:
-                                continue
-                            track_id = int(box.id[0])
-                            if track_id not in person_tracks:
-                                person_tracks[track_id] = PersonTrack(track_id)
-                            person_tracks[track_id].update(center)
-
-                dead = [tid for tid, t in person_tracks.items() if not t.is_alive()]
-                for tid in dead:
-                    del person_tracks[tid]
-
-                alive_count = len([t for t in person_tracks.values() if t.is_alive()])
-
-                if frame_count % 30 == 0:
-                    print(f"[{camera['name']}] Frame #{frame_count} | "
-                          f"People: {alive_count} | Rackets: {len(rackets)}", flush=True)
-
-                # Привязка людей к ближайшему столу
-                table_persons = {tid: {} for tid in table_trackers}
-
-                for track_id, track in person_tracks.items():
-                    if not track.is_alive() or not track.positions:
-                        continue
-                    pos = track.positions[-1]
-
-                    best_table = None
-                    best_dist = float('inf')
-                    for tid, tracker in table_trackers.items():
-                        if not tracker.point_in_expanded(pos):
-                            continue
-                        # Дистанция считается на ПОЛУ если есть гомография
-                        if tracker.use_homography:
-                            floor_pt = tracker.pixel_to_floor(pos)
-                            if floor_pt is None:
-                                continue
-                            center_floor = tracker.zone_floor.mean(axis=0)
-                            dx = floor_pt[0] - center_floor[0]
-                            dy = floor_pt[1] - center_floor[1]
-                        else:
-                            center = tracker.zone_pixel.mean(axis=0)
-                            dx = pos[0] - center[0]
-                            dy = pos[1] - center[1]
-                        dist = (dx * dx + dy * dy) ** 0.5
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_table = tid
-
-                    if best_table is not None:
-                        table_persons[best_table][track_id] = track
-
-                # Ракетки к ближайшему столу
-                table_rackets = {tid: [] for tid in table_trackers}
-                for racket_pt in rackets:
-                    best_table = None
-                    best_dist = float('inf')
-                    for tid, tracker in table_trackers.items():
-                        if not tracker.point_in_expanded(racket_pt):
-                            continue
-                        if tracker.use_homography:
-                            floor_pt = tracker.pixel_to_floor(racket_pt)
-                            if floor_pt is None:
-                                continue
-                            center_floor = tracker.zone_floor.mean(axis=0)
-                            dx = floor_pt[0] - center_floor[0]
-                            dy = floor_pt[1] - center_floor[1]
-                        else:
-                            center = tracker.zone_pixel.mean(axis=0)
-                            dx = racket_pt[0] - center[0]
-                            dy = racket_pt[1] - center[1]
-                        dist = (dx * dx + dy * dy) ** 0.5
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_table = tid
-                    if best_table is not None:
-                        table_rackets[best_table].append(racket_pt)
-
-                for tid, tracker in table_trackers.items():
-                    score = tracker.calculate_score(
-                        table_persons[tid],
-                        table_rackets[tid],
-                        frame
-                    )
-                    tracker.update(score)
-
-                if frame_count % 5 == 0:
-                    active = {}
-                    for tid, tracker in table_trackers.items():
-                        if tracker.session_start is not None:
-                            active[str(tid)] = tracker.session_start
-                    save_active_sessions(camera['id'], active)
-
-        except Exception as e:
-            import traceback
-            print(f"[{camera['name']}] Critical error: {e}", flush=True)
-            traceback.print_exc()
-            time.sleep(5)
-        finally:
+                with self._lock:
+                    self._frame = frame
+                    self._frame_ts = time.time()
             cap.release()
+            time.sleep(1.0)
+        log.info(f'[cam {self.camera_id}] capture stopped')
+
+    def read(self):
+        with self._lock:
+            if self._frame is None:
+                return None, 0.0
+            return self._frame.copy(), self._frame_ts
+
+    def stop(self):
+        self._stop.set()
+
+# ------------------------------------------------------------------ #
+#  YOLO DETECTOR
+# ------------------------------------------------------------------ #
+
+class PersonDetector:
+    """
+    Обёртка над ultralytics YOLO. Пытается грузить OpenVINO INT8 → FP32 → .pt.
+    Возвращает список (x1,y1,x2,y2,conf) для класса 'person'.
+    """
+    def __init__(self):
+        from ultralytics import YOLO
+
+        if os.path.isdir(MODEL_INT8_PATH):
+            log.info(f'Loading YOLO from {MODEL_INT8_PATH} (OpenVINO INT8)')
+            self.model = YOLO(MODEL_INT8_PATH, task='detect')
+        elif os.path.isdir(MODEL_FP32_PATH):
+            log.info(f'Loading YOLO from {MODEL_FP32_PATH} (OpenVINO FP32)')
+            self.model = YOLO(MODEL_FP32_PATH, task='detect')
+        elif os.path.isfile(MODEL_PT_PATH):
+            log.warning(f'OpenVINO model not found, falling back to PyTorch: {MODEL_PT_PATH}')
+            self.model = YOLO(MODEL_PT_PATH)
+        else:
+            raise FileNotFoundError(
+                f'No model found. Expected one of:\n'
+                f'  {MODEL_INT8_PATH}\n  {MODEL_FP32_PATH}\n  {MODEL_PT_PATH}\n'
+                f'Run scripts/convert_to_openvino.py'
+            )
+
+    def detect_people(self, frame):
+        res = self.model.predict(
+            frame,
+            imgsz=YOLO_IMGSZ,
+            conf=YOLO_CONF,
+            classes=[PERSON_CLASS_ID],
+            verbose=False,
+        )[0]
+        out = []
+        if res.boxes is None or len(res.boxes) == 0:
+            return out
+        boxes = res.boxes.xyxy.cpu().numpy()
+        confs = res.boxes.conf.cpu().numpy()
+        for (x1, y1, x2, y2), c in zip(boxes, confs):
+            out.append((float(x1), float(y1), float(x2), float(y2), float(c)))
+        return out
+
+# ------------------------------------------------------------------ #
+#  MOG2 BACKGROUND SUBTRACTION
+# ------------------------------------------------------------------ #
+
+class MotionDetector:
+    """Один MOG2 на камеру. Возвращает бинарную маску движения того же размера."""
+    def __init__(self):
+        self.mog = cv2.createBackgroundSubtractorMOG2(
+            history=MOG2_HISTORY,
+            varThreshold=MOG2_VAR_THRESHOLD,
+            detectShadows=False,
+        )
+
+    def mask(self, frame):
+        m = self.mog.apply(frame, learningRate=MOG2_LEARNING_RATE)
+        # морфология: убираем шум, склеиваем
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN,  kernel)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+        return m
+
+# ------------------------------------------------------------------ #
+#  ЗОНА СТОЛА (расширенная) + быстрая проверка попадания и движения
+# ------------------------------------------------------------------ #
+
+class TableZone:
+    """
+    Гео-данные одного стола в системе конкретной камеры.
+      • polygon_floor_expanded — расширенный 4-угольник на полу (мм), для bbox-теста
+      • polygon_pixel_expanded — он же спроецированный в пиксели (для маски движения)
+      • pixel_mask — заранее построенная бинарная маска (frame_h × frame_w),
+        с которой быстро считать движение через bitwise_and.
+    """
+    def __init__(self, table_id, floor_pts, H, H_inv, frame_shape):
+        self.table_id = table_id
+        self.H = H
+        self.H_inv = H_inv
+
+        self.polygon_floor_expanded = expand_floor_polygon(floor_pts)
+        self.polygon_pixel_expanded = floor_polygon_to_pixels(
+            self.polygon_floor_expanded, H_inv,
+        )
+
+        # Маска того же размера что и кадр (для backsub). Полигон может вылезать
+        # за края кадра — это ок, fillPoly клипит.
+        h, w = frame_shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        pts_int = self.polygon_pixel_expanded.astype(np.int32).reshape(-1, 1, 2)
+        cv2.fillPoly(mask, [pts_int], 255)
+        self.pixel_mask = mask
+        self.mask_area  = int(np.count_nonzero(mask))  # для нормализации motion ratio
+
+    def contains_floor_point(self, floor_xy):
+        return point_in_polygon(floor_xy, self.polygon_floor_expanded)
+
+    def motion_ratio(self, motion_mask):
+        """Доля движущихся пикселей в зоне стола, после фильтра сетки."""
+        if self.mask_area == 0:
+            return 0.0
+        local = cv2.bitwise_and(motion_mask, motion_mask, mask=self.pixel_mask)
+
+        # Фильтр сетки: ищем connected components, выбрасываем те у которых
+        # bbox имеет очень большое отношение сторон (длинные тонкие вертикальные регионы).
+        n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(local, 8)
+        good = 0
+        for i in range(1, n_labels):
+            x, y, w, h, area = stats[i]
+            if area < 30:
+                continue
+            ar = max(h, w) / max(1, min(h, w))
+            if ar > NET_MAX_ASPECT_RATIO:
+                continue  # похоже на сетку — игнор
+            good += area
+        return good / self.mask_area
+
+# ------------------------------------------------------------------ #
+#  СОСТОЯНИЕ СТОЛА: скользящее окно + гистерезисная сессия
+# ------------------------------------------------------------------ #
+
+class TableState:
+    """
+    На каждый тик принимает 0 или 1 (была занятость в этом тике или нет),
+    держит окно WINDOW_SIZE последних значений, считает ratio занятости,
+    управляет состоянием сессии гистерезисом.
+    """
+    def __init__(self, table_id, rule):
+        self.table_id = table_id
+        self.rule = rule
+        self.window = deque(maxlen=WINDOW_SIZE)
+        self.is_active = False
+        self.session_start_ts = None
+        # анти-флап: запоминаем время последнего изменения состояния
+        self._last_change_ts = 0.0
+
+    def tick(self, occupied_now, now_ts):
+        """Возвращает событие: None | ('start', ts) | ('stop', start_ts, end_ts)."""
+        self.window.append(1 if occupied_now else 0)
+
+        # ratio считаем только когда окно набралось хотя бы наполовину,
+        # иначе при старте процесса будут ложные срабатывания.
+        if len(self.window) < WINDOW_SIZE // 2:
+            return None
+
+        ratio = sum(self.window) / len(self.window)
+
+        # пороги per-table из правил, если заданы — иначе глобальные
+        start_th = self.rule.get('window_start_ratio', START_RATIO)
+        stop_th  = self.rule.get('window_stop_ratio',  STOP_RATIO)
+
+        event = None
+        if not self.is_active and ratio >= start_th:
+            self.is_active = True
+            # старт сессии помечаем "задним числом" — на ~окно назад,
+            # но не раньше последнего перехода. Это даёт честную длительность.
+            self.session_start_ts = max(now_ts - WINDOW_SECONDS * start_th,
+                                        self._last_change_ts)
+            self._last_change_ts = now_ts
+            event = ('start', self.session_start_ts)
+        elif self.is_active and ratio <= stop_th:
+            start_ts = self.session_start_ts
+            # конец сессии — "когда сигнал упал", оцениваем как сейчас минус
+            # (1 - stop_th) * window (т.е. сколько уже было пусто)
+            end_ts = now_ts - WINDOW_SECONDS * (1 - stop_th) * 0.5
+            end_ts = max(end_ts, start_ts + 1)
+            self.is_active = False
+            self.session_start_ts = None
+            self._last_change_ts = now_ts
+            event = ('stop', start_ts, end_ts)
+        return event
+
+    def force_stop(self, end_ts):
+        """Принудительный стоп (свет погас / выключение). Возвращает событие или None."""
+        if self.is_active and self.session_start_ts is not None:
+            start_ts = self.session_start_ts
+            self.is_active = False
+            self.session_start_ts = None
+            self.window.clear()
+            return ('stop', start_ts, max(end_ts, start_ts + 1))
+        return None
+
+# ------------------------------------------------------------------ #
+#  БД И ACTIVE.JSON
+# ------------------------------------------------------------------ #
+
+def db_connect():
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def write_session(table_id, start_ts, end_ts, billed_seconds=None):
+    """
+    Пишет сессию в БД.
+      start_ts — время первого START (начало цепочки)
+      end_ts   — время последнего STOP (конец цепочки)
+      billed_seconds — реальное игровое время БЕЗ пауз (для склеенных сессий).
+                       Если None — равно end_ts - start_ts (нет пауз).
+    """
+    span = int(end_ts - start_ts)
+    duration = int(billed_seconds) if billed_seconds is not None else span
+    if duration < MIN_SESSION_SECONDS:
+        log.info(f'[t{table_id}] session {duration}s < {MIN_SESSION_SECONDS}s — discard')
+        return
+    start_str = datetime.fromtimestamp(start_ts).strftime('%Y-%m-%d %H:%M:%S.%f')
+    end_str   = datetime.fromtimestamp(end_ts  ).strftime('%Y-%m-%d %H:%M:%S.%f')
+    try:
+        conn = db_connect()
+        conn.execute(
+            "INSERT INTO sessions (table_id, start_time, end_time, duration_seconds) "
+            "VALUES (?, ?, ?, ?)",
+            (int(table_id), start_str, end_str, duration),
+        )
+        conn.commit()
+        conn.close()
+        gap_info = f' (span={span}s, billed={duration}s, paused={span-duration}s)' if span != duration else ''
+        log.info(f'[t{table_id}] session saved: {duration}s{gap_info} ({start_str} → {end_str})')
+    except Exception as e:
+        log.exception(f'[t{table_id}] DB write failed: {e}')
+
+_active_lock = threading.Lock()
+
+def update_active_file(active_sessions):
+    """active_sessions: dict {table_id: start_ts}."""
+    with _active_lock:
+        payload = {str(tid): {'start': float(ts)} for tid, ts in active_sessions.items()}
+        tmp = ACTIVE_FILE + '.tmp'
+        try:
+            with open(tmp, 'w') as f:
+                json.dump(payload, f)
+            os.replace(tmp, ACTIVE_FILE)
+        except Exception as e:
+            log.exception(f'active.json write failed: {e}')
+
+# ------------------------------------------------------------------ #
+#  ВРЕМЕННОЕ ОКНО РАБОТЫ ЗАЛА
+# ------------------------------------------------------------------ #
+
+def lights_are_on(now=None):
+    """Считаем что зал работает между LIGHTS_ON и LIGHTS_OFF локального времени."""
+    now = now or datetime.now()
+    t = now.time()
+    return LIGHTS_ON <= t < LIGHTS_OFF
+
+# ------------------------------------------------------------------ #
+#  ГЛАВНЫЙ ЦИКЛ НА ОДНУ КАМЕРУ
+# ------------------------------------------------------------------ #
+
+class CameraWorker(threading.Thread):
+    """
+    Один поток на камеру: тикает раз в TICK_INTERVAL_S,
+    обновляет окна состояний всех столов этой камеры, пишет события.
+
+    detector передаётся снаружи (общий на весь процесс, потокобезопасен).
+    active_sessions — общий dict {table_id: start_ts}, защищён active_lock.
+    """
+    def __init__(self, camera_cfg, zones, homography, default_rule, rules,
+                 detector, active_sessions, active_lock):
+        super().__init__(daemon=True, name=f'worker-{camera_cfg["id"]}')
+        self.cam_id     = camera_cfg['id']
+        self.cam_name   = camera_cfg.get('name', f'cam{self.cam_id}')
+        self.rtsp_url   = camera_cfg['rtsp']
+        self.tables_ids = camera_cfg.get('tables', [])
+        self.detector   = detector
+        self.active_sessions = active_sessions
+        self.active_lock     = active_lock
+
+        # фильтруем зоны, относящиеся к этой камере
+        self.zones_raw = {
+            int(tid): z for tid, z in zones.items()
+            if int(z['camera_id']) == self.cam_id and int(tid) in self.tables_ids
+        }
+        self.homog = homography[self.cam_id]
+        self.default_rule = default_rule
+        self.rules = rules
+
+        # объекты состояния по каждому столу
+        self.states = {
+            tid: TableState(tid, rule_for(tid, default_rule, rules))
+            for tid in self.zones_raw
+        }
+        # geo-объекты создаём при получении первого кадра (нужен shape)
+        self.zone_geo = {}      # {tid: TableZone}
+        self.motion   = MotionDetector()
+
+        self.capture = RTSPCapture(self.cam_id, self.rtsp_url)
+        self._stop   = threading.Event()
+        self._last_snapshot_ts = 0.0
+        self._tick_counter = 0  # для калибровочного семплинга
+        self._last_evidence_ts = 0.0  # для evidence-снимков
+        # Склейка сессий. Формат:
+        #   _pending_stops[tid] = (orig_start_ts, last_stop_ts, accumulated_billed_s)
+        # orig_start_ts — самый первый старт цепочки склеенных сегментов
+        # last_stop_ts — когда последний раз закрылись (для расчёта grace)
+        # accumulated_billed_s — реальное игровое время (БЕЗ пауз)
+        self._pending_stops = {}
+        # активные сессии этой камеры с учётом склейки. Формат:
+        #   _active_meta[tid] = (orig_start_ts, billed_before_this_segment_s)
+        # billed_before — сколько уже накапало в предыдущих сегментах
+        # текущий сегмент = now - <последний START этого сегмента>
+        self._active_meta = {}
+
+    def stop(self):
+        self._stop.set()
+
+    def _ensure_geo(self, frame_shape):
+        if self.zone_geo:
+            return
+        for tid, z in self.zones_raw.items():
+            self.zone_geo[tid] = TableZone(
+                tid, z['points_floor'],
+                self.homog['H'], self.homog['H_inv'],
+                frame_shape,
+            )
+        log.info(f'[cam {self.cam_id}] geo built for tables: {sorted(self.zone_geo.keys())}')
+
+    def _save_snapshot(self, frame):
+        path = os.path.join(SNAP_DIR, f'cam_{self.cam_id}.jpg')
+        try:
+            os.makedirs(SNAP_DIR, exist_ok=True)
+            ok = cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if not ok:
+                log.warning(f'[cam {self.cam_id}] cv2.imwrite returned False for {path}')
+        except Exception as e:
+            log.exception(f'[cam {self.cam_id}] snapshot save failed: {e}')
+
+    def _save_evidence_frame(self, frame):
+        """Сохраняет кадр в data/evidence/YYYY-MM-DD/cam{N}/HH-MM.jpg с timestamp в углу."""
+        try:
+            now = datetime.now()
+            date_str = now.strftime('%Y-%m-%d')
+            time_str = now.strftime('%H-%M')
+            full_ts  = now.strftime('%Y-%m-%d %H:%M:%S')
+
+            day_dir = os.path.join(EVIDENCE_DIR, date_str, f'cam{self.cam_id}')
+            os.makedirs(day_dir, exist_ok=True)
+            path = os.path.join(day_dir, f'{time_str}.jpg')
+
+            # Накладываем дату/время в правом нижнем углу
+            annotated = frame.copy()
+            h, w = annotated.shape[:2]
+            text = full_ts
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            scale = max(0.6, w / 1920 * 0.9)
+            thickness = max(1, int(w / 1920 * 2))
+            (tw, th), _ = cv2.getTextSize(text, font, scale, thickness)
+            margin = int(w / 1920 * 20)
+            x = w - tw - margin
+            y = h - margin
+            # полупрозрачная подложка для читабельности
+            overlay = annotated.copy()
+            cv2.rectangle(overlay,
+                          (x - 10, y - th - 10),
+                          (x + tw + 10, y + 10),
+                          (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
+            cv2.putText(annotated, text, (x, y), font, scale,
+                        (255, 255, 255), thickness, cv2.LINE_AA)
+
+            ok = cv2.imwrite(path, annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if not ok:
+                log.warning(f'[cam {self.cam_id}] evidence imwrite failed: {path}')
+        except Exception as e:
+            log.exception(f'[cam {self.cam_id}] evidence save failed: {e}')
+
+    def _save_calibration_frame(self, frame):
+        """Сохраняет кадр для INT8-калибровки. Cap на CALIB_MAX_PER_CAM на камеру."""
+        try:
+            os.makedirs(CALIB_DIR, exist_ok=True)
+            prefix = f'cam{self.cam_id}_'
+            existing = len([f for f in os.listdir(CALIB_DIR)
+                           if f.startswith(prefix) and f.endswith('.jpg')])
+            if existing >= CALIB_MAX_PER_CAM:
+                return
+            fn = f'{prefix}{int(time.time()*1000)}.jpg'
+            path = os.path.join(CALIB_DIR, fn)
+            ok = cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if not ok:
+                log.warning(f'[cam {self.cam_id}] cv2.imwrite returned False for calibration frame')
+        except Exception as e:
+            log.exception(f'[cam {self.cam_id}] calibration save failed: {e}')
+
+    def _flush_expired_pending(self, now_ts):
+        """Pending stops старше grace — пишем в БД как окончательно закрытые сессии."""
+        if not self._pending_stops:
+            return
+        expired = []
+        for tid, (orig_s, last_e, billed) in list(self._pending_stops.items()):
+            if now_ts - last_e > SESSION_MERGE_GRACE_S:
+                expired.append((tid, orig_s, last_e, billed))
+        for tid, s, e, billed in expired:
+            write_session(tid, s, e, billed_seconds=billed)
+            del self._pending_stops[tid]
+            log.info(f'[t{tid}] session finalized (grace expired)')
+
+    def _tick(self):
+        frame, frame_ts = self.capture.read()
+        if frame is None:
+            return
+        self._ensure_geo(frame.shape)
+
+        now_ts = time.time()
+        lights = lights_are_on()
+
+        # сначала — финализируем pending stops старше grace
+        self._flush_expired_pending(now_ts)
+
+        # снапшот для дашборда
+        if now_ts - self._last_snapshot_ts >= SNAPSHOT_EVERY_S:
+            self._save_snapshot(frame)
+            self._last_snapshot_ts = now_ts
+
+        # evidence-снимок раз в 15 минут, только в рабочем окне 10:00-22:00
+        if (now_ts - self._last_evidence_ts >= EVIDENCE_INTERVAL_S):
+            hour = datetime.now().hour
+            if EVIDENCE_HOUR_START <= hour < EVIDENCE_HOUR_END:
+                self._save_evidence_frame(frame)
+                self._last_evidence_ts = now_ts
+
+        # сбор калибровочного датасета (если включено через env)
+        self._tick_counter += 1
+        if COLLECT_CALIBRATION and (self._tick_counter % CALIB_EVERY_N_TICKS == 0):
+            self._save_calibration_frame(frame)
+
+        # Если света нет — никаких новых сигналов. Просто закрываем активные
+        # сессии этой камеры если они ещё открыты.
+        if not lights:
+            for tid, st in self.states.items():
+                ev = st.force_stop(now_ts)
+                if ev is not None:
+                    _, seg_start, seg_end = ev
+                    meta = self._active_meta.pop(tid, None)
+                    if meta is None:
+                        write_session(tid, seg_start, seg_end)
+                    else:
+                        orig_start, billed_before, real_seg_start = meta
+                        seg_duration = max(0.0, seg_end - real_seg_start)
+                        write_session(tid, orig_start, seg_end,
+                                      billed_seconds=billed_before + seg_duration)
+                    with self.active_lock:
+                        self.active_sessions.pop(tid, None)
+                    update_active_file(self.active_sessions)
+            # свет погас — pending больше не имеет смысла, финализируем всё
+            for tid, (orig_s, last_e, billed) in list(self._pending_stops.items()):
+                write_session(tid, orig_s, last_e, billed_seconds=billed)
+            self._pending_stops.clear()
+            return
+
+        # --- YOLO: люди в кадре ---
+        try:
+            people = self.detector.detect_people(frame)
+        except Exception as e:
+            log.exception(f'[cam {self.cam_id}] YOLO failed: {e}')
+            people = []
+
+        # для каждого человека — нижняя точка bbox (между ног), в координатах пола
+        people_on_floor = []
+        for (x1, y1, x2, y2, conf) in people:
+            foot_px = ((x1 + x2) / 2.0, y2)
+            try:
+                floor_xy = pixel_to_floor(foot_px, self.homog['H'])
+            except Exception:
+                continue
+            people_on_floor.append(floor_xy)
+
+        # --- MOG2: маска движения ---
+        try:
+            motion_mask = self.motion.mask(frame)
+        except Exception as e:
+            log.exception(f'[cam {self.cam_id}] MOG2 failed: {e}')
+            motion_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+
+        # --- для каждого стола: сигнал занятости этого тика ---
+        for tid, geo in self.zone_geo.items():
+            rule = self.states[tid].rule
+            min_people = int(rule.get('min_stable_people', 1))
+            require_movement = bool(rule.get('require_movement', True))
+
+            # сколько людей в расширенной зоне стола (на полу)
+            n_people_here = sum(
+                1 for p in people_on_floor if geo.contains_floor_point(p)
+            )
+            people_ok = n_people_here >= min_people
+
+            # доля движения в маске стола
+            motion = geo.motion_ratio(motion_mask)
+            # порог движения — может быть переопределён в table_rules per-table
+            motion_threshold = float(rule.get('motion_threshold', MOTION_RATIO_THRESHOLD))
+            motion_ok = motion >= motion_threshold
+
+            # ПРАВИЛО ТИКА (консервативное, FP дороже FN):
+            # — если require_movement: нужны И люди И движение
+            # — иначе достаточно min_stable_people (стол далеко/за сетками — стол 6,7,11)
+            if require_movement:
+                occupied = people_ok and motion_ok
+            else:
+                occupied = people_ok or (n_people_here >= 1 and motion_ok)
+
+            # диагностический лог: для столов из DEBUG_TABLES_SET пишем что видим
+            if tid in DEBUG_TABLES_SET and (self._tick_counter % DEBUG_LOG_EVERY_N_TICKS == 0):
+                window = self.states[tid].window
+                window_ratio = sum(window) / max(1, len(window))
+                is_active = self.states[tid].is_active
+                log.info(f'[DEBUG t{tid}] people_in_zone={n_people_here} '
+                         f'motion={motion:.4f}(thr={motion_threshold:.4f}) '
+                         f'occupied_now={occupied} '
+                         f'window={sum(window)}/{len(window)}={window_ratio:.2f} '
+                         f'active={is_active} '
+                         f'req_mov={require_movement}')
+                # если людей в зоне нет — покажем где они вообще и где зона
+                if n_people_here == 0 and people_on_floor:
+                    # центр зоны стола в координатах пола
+                    zc = geo.polygon_floor_expanded.mean(axis=0)
+                    z_min = geo.polygon_floor_expanded.min(axis=0)
+                    z_max = geo.polygon_floor_expanded.max(axis=0)
+                    log.info(f'[DEBUG t{tid}] zone_center=({zc[0]:.0f},{zc[1]:.0f}) '
+                             f'zone_bbox=x[{z_min[0]:.0f}..{z_max[0]:.0f}] '
+                             f'y[{z_min[1]:.0f}..{z_max[1]:.0f}]')
+                    for i, p in enumerate(people_on_floor[:5]):  # не больше 5 людей в логе
+                        dx = p[0] - zc[0]
+                        dy = p[1] - zc[1]
+                        log.info(f'[DEBUG t{tid}]   person{i}: floor=({p[0]:.0f},{p[1]:.0f}) '
+                                 f'dist_from_zone_center=({dx:+.0f},{dy:+.0f})mm')
+
+            event = self.states[tid].tick(occupied, now_ts)
+            if event is None:
+                continue
+            if event[0] == 'start':
+                _, start_ts = event
+                # СКЛЕЙКА: есть ли в pending свежий STOP для этого стола?
+                pending = self._pending_stops.get(tid)
+                if pending is not None:
+                    p_orig_start, p_stop_ts, p_billed = pending
+                    gap = start_ts - p_stop_ts
+                    if 0 <= gap <= SESSION_MERGE_GRACE_S:
+                        # склеиваем: orig_start сохраняется, billed_before тоже,
+                        # новый сегмент начнётся от start_ts
+                        self._active_meta[tid] = (p_orig_start, p_billed, start_ts)
+                        del self._pending_stops[tid]
+                        log.info(f'[t{tid}] START (merged after {int(gap)}s pause, '
+                                 f'billed_so_far={int(p_billed)}s, '
+                                 f'people={n_people_here}, motion={motion:.3f})')
+                    else:
+                        # gap слишком большой — финализируем pending, стартуем новую
+                        write_session(tid, p_orig_start, p_stop_ts, billed_seconds=p_billed)
+                        del self._pending_stops[tid]
+                        self._active_meta[tid] = (start_ts, 0.0, start_ts)
+                        log.info(f'[t{tid}] START (people={n_people_here}, motion={motion:.3f})')
+                else:
+                    self._active_meta[tid] = (start_ts, 0.0, start_ts)
+                    log.info(f'[t{tid}] START (people={n_people_here}, motion={motion:.3f})')
+
+                with self.active_lock:
+                    self.active_sessions[tid] = start_ts
+                update_active_file(self.active_sessions)
+                self.states[tid].session_start_ts = start_ts
+            else:
+                _, segment_start_ts, end_ts = event
+                meta = self._active_meta.pop(tid, None)
+                if meta is None:
+                    # на всякий случай: если meta нет, обходимся без склейки
+                    orig_start = segment_start_ts
+                    billed_before = 0.0
+                    seg_start = segment_start_ts
+                else:
+                    orig_start, billed_before, seg_start = meta
+                # длина закрывающегося сегмента
+                seg_duration = max(0.0, end_ts - seg_start)
+                accumulated_billed = billed_before + seg_duration
+                # кладём в pending — может прийти склейка
+                self._pending_stops[tid] = (orig_start, end_ts, accumulated_billed)
+                with self.active_lock:
+                    self.active_sessions.pop(tid, None)
+                update_active_file(self.active_sessions)
+                log.info(f'[t{tid}] STOP  (segment={int(seg_duration)}s, '
+                         f'billed_total={int(accumulated_billed)}s, '
+                         f'pending merge for {SESSION_MERGE_GRACE_S}s, '
+                         f'people={n_people_here}, motion={motion:.3f})')
+
+    def run(self):
+        self.capture.start()
+        # дать капчуру шанс получить первый кадр
+        time.sleep(2.0)
+        log.info(f'[cam {self.cam_id}] worker started, tables={sorted(self.tables_ids)}')
+        next_tick = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                self._tick()
+            except Exception as e:
+                log.exception(f'[cam {self.cam_id}] tick failed: {e}')
+            next_tick += TICK_INTERVAL_S
+            sleep = next_tick - time.monotonic()
+            if sleep > 0:
+                time.sleep(sleep)
+            else:
+                # отстаём — пересинхронизируемся
+                next_tick = time.monotonic()
+        self.capture.stop()
+        log.info(f'[cam {self.cam_id}] worker stopped')
+
+# ------------------------------------------------------------------ #
+#  ENTRY POINT
+# ------------------------------------------------------------------ #
+
+def cleanup_old_evidence():
+    """Удаляет evidence-папки старше EVIDENCE_KEEP_DAYS дней."""
+    if not os.path.isdir(EVIDENCE_DIR):
+        return
+    cutoff = datetime.now().date()
+    removed = 0
+    for name in os.listdir(EVIDENCE_DIR):
+        day_path = os.path.join(EVIDENCE_DIR, name)
+        if not os.path.isdir(day_path):
+            continue
+        try:
+            day_date = datetime.strptime(name, '%Y-%m-%d').date()
+        except ValueError:
+            continue
+        age_days = (cutoff - day_date).days
+        if age_days > EVIDENCE_KEEP_DAYS:
+            try:
+                import shutil
+                shutil.rmtree(day_path)
+                removed += 1
+            except Exception as e:
+                log.warning(f'failed to remove {day_path}: {e}')
+    if removed:
+        log.info(f'evidence cleanup: removed {removed} old day folders')
 
 
 def main():
-    init_db()
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    os.makedirs(EVIDENCE_DIR, exist_ok=True)
+    cleanup_old_evidence()
+    if COLLECT_CALIBRATION:
+        os.makedirs(CALIB_DIR, exist_ok=True)
+        log.info(f'CALIBRATION MODE: saving frames to {CALIB_DIR} '
+                 f'(every {CALIB_EVERY_N_TICKS} ticks, cap {CALIB_MAX_FILES})')
 
-    if not os.path.exists(ZONES_FILE):
-        print("Mark tables first: python backend/marker_v2.py")
-        return
+    zones      = load_zones()
+    homography = load_homographies()
+    default_rule, rules = load_rules()
 
-    with open(ZONES_FILE, 'r') as f:
-        zones = json.load(f)
-    print(f"Loaded zones: {len(zones)}")
+    log.info(f'Zones: {len(zones)} tables, homographies: {sorted(homography.keys())}')
+    log.info(f'Rules: default={default_rule}, per-table={sorted(rules.keys())}')
 
-    threads = []
-    for camera in CAMERAS:
-        t = threading.Thread(
-            target=process_camera,
-            args=(camera, zones),
-            daemon=True
-        )
-        t.start()
-        threads.append(t)
-        time.sleep(3)
+    detector = PersonDetector()  # один на процесс — Ultralytics+OpenVINO потокобезопасен на инференс
 
-    print("\nAnalysis running. Ctrl+C to stop\n")
+    active_sessions = {}    # {table_id: start_ts}
+    active_lock     = threading.Lock()
+    update_active_file(active_sessions)  # пустой стартовый файл
+
+    workers = [
+        CameraWorker(cam, zones, homography, default_rule, rules,
+                     detector, active_sessions, active_lock)
+        for cam in CAMERAS
+    ]
+    for w in workers:
+        w.start()
 
     try:
         while True:
-            time.sleep(1)
+            time.sleep(1.0)
     except KeyboardInterrupt:
-        print("\nStopping...")
+        log.info('Shutdown requested')
+    finally:
+        for w in workers:
+            w.stop()
+        # дать тредам корректно закрыть RTSP
+        for w in workers:
+            w.join(timeout=5.0)
+        # закрыть все ещё-активные сессии и финализировать pending
+        now_ts = time.time()
+        for w in workers:
+            for tid, st in w.states.items():
+                ev = st.force_stop(now_ts)
+                if ev is not None:
+                    _, seg_start, seg_end = ev
+                    meta = w._active_meta.pop(tid, None)
+                    if meta is None:
+                        write_session(tid, seg_start, seg_end)
+                    else:
+                        orig_start, billed_before, real_seg_start = meta
+                        seg_duration = max(0.0, seg_end - real_seg_start)
+                        write_session(tid, orig_start, seg_end,
+                                      billed_seconds=billed_before + seg_duration)
+            for tid, (orig_s, last_e, billed) in list(w._pending_stops.items()):
+                write_session(tid, orig_s, last_e, billed_seconds=billed)
+            w._pending_stops.clear()
+        update_active_file({})
+        log.info('Bye')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

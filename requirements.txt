@@ -1,4 +1,13 @@
-opencv-python
-ultralytics
-flask
-numpy
+# Core
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+
+# YOLO + OpenVINO
+ultralytics>=8.3.0
+openvino>=2024.0.0
+nncf>=2.10.0
+
+# Backend (Flask) — уже стоит, но на всякий случай
+flask>=3.0.0
+flask-login>=0.6.3
+python-dotenv>=1.0.0

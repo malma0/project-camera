@@ -345,6 +345,79 @@ def stats_weekly():
     conn.close()
     return jsonify(result)
 
+EVIDENCE_DIR = os.path.join(DATA_DIR, 'evidence')
+
+
+@app.route('/evidence')
+@login_required
+def evidence_page():
+    """Страница просмотра evidence-снимков."""
+    return send_from_directory(FRONTEND_DIR, 'evidence.html')
+
+
+@app.route('/api/evidence/days')
+@login_required
+def evidence_days():
+    """Возвращает список доступных дней (отсортированный, новые сверху)."""
+    if not os.path.isdir(EVIDENCE_DIR):
+        return jsonify([])
+    days = []
+    for name in os.listdir(EVIDENCE_DIR):
+        path = os.path.join(EVIDENCE_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        # валидируем формат YYYY-MM-DD
+        try:
+            from datetime import datetime as _dt
+            _dt.strptime(name, '%Y-%m-%d')
+            days.append(name)
+        except ValueError:
+            continue
+    days.sort(reverse=True)
+    return jsonify(days)
+
+
+@app.route('/api/evidence/<date_str>')
+@login_required
+def evidence_for_day(date_str):
+    """
+    Возвращает для указанного дня список снимков по камерам:
+    {
+      "cam1": ["08-00.jpg", "08-15.jpg", ...],
+      "cam2": [...]
+    }
+    """
+    # защита от path traversal
+    if not all(c.isdigit() or c == '-' for c in date_str) or len(date_str) != 10:
+        return jsonify({"error": "bad date"}), 400
+    day_dir = os.path.join(EVIDENCE_DIR, date_str)
+    if not os.path.isdir(day_dir):
+        return jsonify({})
+    result = {}
+    for cam_name in sorted(os.listdir(day_dir)):
+        cam_path = os.path.join(day_dir, cam_name)
+        if not os.path.isdir(cam_path):
+            continue
+        files = sorted([f for f in os.listdir(cam_path) if f.endswith('.jpg')])
+        result[cam_name] = files
+    return jsonify(result)
+
+
+@app.route('/api/evidence/<date_str>/<cam>/<filename>')
+@login_required
+def evidence_image(date_str, cam, filename):
+    """Отдаёт сам JPEG-файл."""
+    # path traversal protection
+    if '..' in date_str or '..' in cam or '..' in filename or '/' in filename or '\\' in filename:
+        return '', 403
+    if not filename.endswith('.jpg'):
+        return '', 403
+    path = os.path.join(EVIDENCE_DIR, date_str, cam, filename)
+    if not os.path.isfile(path):
+        return '', 404
+    return send_from_directory(os.path.join(EVIDENCE_DIR, date_str, cam), filename)
+
+
 if __name__ == "__main__":
     init_db()
     app.run(host='0.0.0.0', port=5000, debug=True)

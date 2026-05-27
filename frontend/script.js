@@ -216,3 +216,38 @@ setInterval(() => {
 }, 60000);
 
 loadAll();
+
+(function setupSmoothCameraRefresh() {
+    const CAMERA_REFRESH_MS = 2000;
+
+    function refreshCamera(id) {
+        const img = document.getElementById(id);
+        if (!img) return;
+
+        // Создаём скрытое изображение, грузим в него новый кадр.
+        // Когда загрузится — подменяем видимое одним движением через fade.
+        const next = new Image();
+        const camNum = id.replace('cam', '');
+        const url = `/api/cameras/${camNum}/snapshot?t=${Date.now()}`;
+
+        next.onload = () => {
+            img.style.transition = 'opacity 0.25s ease';
+            img.style.opacity = '0.6';
+            setTimeout(() => {
+                img.src = next.src;
+                img.style.opacity = '1';
+            }, 120);
+        };
+        next.onerror = () => { /* RTSP моргнул — просто пропустим тик */ };
+        next.src = url;
+    }
+
+    function loop() {
+        refreshCamera('cam1');
+        refreshCamera('cam2');
+    }
+
+    // Запускаем сразу и потом каждые N мс
+    loop();
+    setInterval(loop, CAMERA_REFRESH_MS);
+})();
