@@ -1,8 +1,10 @@
-from flask import Flask, jsonify, request, send_from_directory, redirect, url_for, render_template_string
+from flask import Flask, jsonify, request, send_from_directory, redirect, url_for, render_template_string, Response
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from datetime import date
-import sys, os, json, time
+import sys, os, json, time, threading
 from dotenv import load_dotenv
+
+import cv2
 
 load_dotenv()
 
@@ -12,6 +14,7 @@ from config import CAMERAS
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'frontend')
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+SNAPSHOTS_DIR = os.path.join(DATA_DIR, 'snapshots')
 
 app = Flask(__name__, static_folder=FRONTEND_DIR, static_url_path='')
 app.secret_key = os.getenv("SECRET_KEY", "super-secret-key-change-this")
@@ -22,6 +25,147 @@ login_manager.login_view = "login_page"
 
 DASHBOARD_USER = os.getenv("DASHBOARD_USER", "admin")
 DASHBOARD_PASS = os.getenv("DASHBOARD_PASS", "admin")
+
+# ====================== LIVE MJPEG (real-time, не файлы) ======================
+# Раньше: фронт читал cam_N.jpg который analyzer пишет раз в 2 сек → 0.5 fps.
+# Теперь: app.py сам держит RTSP-коннект параллельно с analyzer и отдаёт каждый
+# кадр в MJPEG. Анализатор это никак не задевает — у RTSP-камеры свой
+# мультиклиент, оба процесса смотрят независимо.
+# FPS на фронте ~12-15 (ограничен JPEG-энкодером на CPU, а не сетью).
+MJPEG_JPEG_QUALITY     = 70       # 70 — хороший баланс качество/размер
+MJPEG_MAX_FPS          = 15       # верхний предел отдачи (не грузим CPU)
+MJPEG_DOWNSCALE_WIDTH  = 960      # ресайз перед jpeg (None = без ресайза). Поток с камер
+                                  # обычно 1920x1080, для дашборда 960 более чем хватает.
+RTSP_RECONNECT_BACKOFF = (1.0, 30.0)  # min, max секунд между попытками
+
+
+class RtspBroadcaster(threading.Thread):
+    """
+    Один поток на камеру: держит cv2.VideoCapture к RTSP, всегда хранит
+    свежайший кадр в памяти. MJPEG-эндпоинты читают этот кадр без блокировок.
+
+    Drop-old: если энкодер не успевает — мы просто пропускаем кадры,
+    не копим их (камера всегда показывает "сейчас", а не "5 секунд назад").
+
+    Условное подключение: пока никто не смотрит стрим — не открываем RTSP.
+    Когда первый клиент подключился — стартуем RTSP. Через IDLE_TIMEOUT после
+    последнего клиента — отпускаем RTSP. Так фон не жрёт CPU зря.
+    """
+    IDLE_TIMEOUT_S = 30.0
+
+    def __init__(self, cam_id: int, rtsp_url: str):
+        super().__init__(daemon=True, name=f'mjpeg-{cam_id}')
+        self.cam_id = cam_id
+        self.rtsp_url = rtsp_url
+        self._lock = threading.Lock()
+        self._frame_jpeg = None       # последний JPEG-кадр (bytes)
+        self._frame_ts = 0.0
+        self._stop = threading.Event()
+        self._active_clients = 0
+        self._last_client_ts = 0.0
+        self._cap = None
+
+    def client_attached(self):
+        with self._lock:
+            self._active_clients += 1
+            self._last_client_ts = time.time()
+
+    def client_detached(self):
+        with self._lock:
+            self._active_clients = max(0, self._active_clients - 1)
+            self._last_client_ts = time.time()
+
+    def latest(self):
+        """Возвращает (jpeg_bytes, ts) или (None, 0) если пока нет кадра."""
+        with self._lock:
+            return self._frame_jpeg, self._frame_ts
+
+    def run(self):
+        # ставим FFmpeg в TCP-режим — UDP теряет пакеты и провоцирует те самые
+        # h264 decode errors что у тебя в логах
+        os.environ.setdefault('OPENCV_FFMPEG_CAPTURE_OPTIONS', 'rtsp_transport;tcp')
+
+        min_back, max_back = RTSP_RECONNECT_BACKOFF
+        backoff = min_back
+        frame_interval = 1.0 / MJPEG_MAX_FPS
+        last_emit = 0.0
+
+        while not self._stop.is_set():
+            # ждём пока кто-то будет смотреть стрим — не открываем RTSP зря
+            with self._lock:
+                idle = (self._active_clients == 0 and
+                        (time.time() - self._last_client_ts) > self.IDLE_TIMEOUT_S)
+            if idle:
+                if self._cap is not None:
+                    self._cap.release()
+                    self._cap = None
+                time.sleep(0.5)
+                continue
+
+            # открываем RTSP
+            if self._cap is None or not self._cap.isOpened():
+                self._cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                if not self._cap.isOpened():
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, max_back)
+                    continue
+                backoff = min_back
+
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                # обрыв — переоткрываем
+                try:
+                    self._cap.release()
+                except Exception:
+                    pass
+                self._cap = None
+                time.sleep(0.5)
+                continue
+
+            now = time.time()
+            if now - last_emit < frame_interval:
+                # пропускаем кадр, не насилуем CPU энкодером
+                continue
+            last_emit = now
+
+            # ресайз перед jpeg чтобы CPU/трафик не страдали
+            if MJPEG_DOWNSCALE_WIDTH and frame.shape[1] > MJPEG_DOWNSCALE_WIDTH:
+                h, w = frame.shape[:2]
+                new_w = MJPEG_DOWNSCALE_WIDTH
+                new_h = int(h * (new_w / w))
+                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, MJPEG_JPEG_QUALITY])
+            if not ok:
+                continue
+            with self._lock:
+                self._frame_jpeg = buf.tobytes()
+                self._frame_ts = now
+
+        # cleanup
+        if self._cap is not None:
+            try:
+                self._cap.release()
+            except Exception:
+                pass
+
+
+# создаём один Broadcaster на каждую камеру из config.CAMERAS
+_broadcasters: dict = {}
+
+def _get_broadcaster(cam_id: int):
+    b = _broadcasters.get(cam_id)
+    if b is None:
+        # ищем rtsp_url по id в CAMERAS
+        cam_cfg = next((c for c in CAMERAS if int(c['id']) == cam_id), None)
+        if cam_cfg is None:
+            return None
+        b = RtspBroadcaster(cam_id, cam_cfg['rtsp'])
+        b.start()
+        _broadcasters[cam_id] = b
+    return b
+
+# ============================================================================
 
 
 class User(UserMixin):
@@ -240,17 +384,81 @@ def stats_live():
         pass
     return jsonify(result)
 
+
 @app.route('/api/cameras/<int:cam_id>/snapshot')
 @login_required
 def camera_snapshot(cam_id):
-    snapshots_dir = os.path.join(DATA_DIR, 'snapshots')
+    # Старый эндпоинт — оставлен на случай если где-то нужен одиночный кадр
+    # (например, прямая ссылка на текущий снимок камеры). Фронт его больше не дёргает —
+    # он подключается к /stream и получает MJPEG-поток.
     filename = f'cam_{cam_id}.jpg'
-    path = os.path.join(snapshots_dir, filename)
+    path = os.path.join(SNAPSHOTS_DIR, filename)
     if not os.path.exists(path):
         return '', 404
-    response = send_from_directory(snapshots_dir, filename)
+    response = send_from_directory(SNAPSHOTS_DIR, filename)
     response.headers['Cache-Control'] = 'no-store'
     return response
+
+
+def _gen_mjpeg(cam_id: int):
+    """
+    Генератор multipart-ответа. Берёт свежие JPEG-кадры из RtspBroadcaster
+    (он держит RTSP-коннект в отдельном потоке и обновляет кадр на ~15 fps).
+    Никакого чтения с диска — кадры в памяти, real-time.
+    """
+    broadcaster = _get_broadcaster(cam_id)
+    if broadcaster is None:
+        return
+    broadcaster.client_attached()
+    boundary = b'--frame'
+    last_ts = 0.0
+    # сколько ждать новый кадр (если RTSP лёг — отдаём пусто и ждём дальше)
+    poll = 1.0 / (MJPEG_MAX_FPS * 2)  # ~30Hz опрос — реальные кадры всё равно 15fps
+    try:
+        # ждём первый кадр чтобы не отдать клиенту пусто
+        wait_until = time.time() + 5.0
+        while time.time() < wait_until:
+            jpeg, ts = broadcaster.latest()
+            if jpeg is not None:
+                break
+            time.sleep(0.1)
+        while True:
+            jpeg, ts = broadcaster.latest()
+            if jpeg is not None and ts != last_ts:
+                last_ts = ts
+                yield (boundary + b'\r\n'
+                       b'Content-Type: image/jpeg\r\n'
+                       b'Content-Length: ' + str(len(jpeg)).encode() + b'\r\n\r\n'
+                       + jpeg + b'\r\n')
+            time.sleep(poll)
+    except GeneratorExit:
+        return
+    finally:
+        broadcaster.client_detached()
+
+
+@app.route('/api/cameras/<int:cam_id>/stream')
+@login_required
+def camera_stream(cam_id):
+    """
+    MJPEG-стрим. Фронт подключается одним <img src="..."/stream"> и браузер сам
+    держит соединение и обновляет картинку. Раньше фронт долбал /snapshot каждые
+    2 сек через setInterval — это и моргало.
+    """
+    # пускаем только реально существующие камеры из конфига
+    valid_ids = {int(c['id']) for c in CAMERAS}
+    if cam_id not in valid_ids:
+        return '', 404
+    return Response(
+        _gen_mjpeg(cam_id),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+            'X-Accel-Buffering': 'no',  # подсказка nginx — не буферизовать
+        }
+    )
 
 
 def format_stats(stats, week_stats=None):
@@ -285,6 +493,7 @@ def format_stats(stats, week_stats=None):
         })
 
     return result
+
 
 @app.route('/api/stats/week')
 @login_required
@@ -344,6 +553,7 @@ def stats_weekly():
     result = [{"weekday": d, "total_seconds": by_day.get(d, 0)} for d in range(7)]
     conn.close()
     return jsonify(result)
+
 
 EVIDENCE_DIR = os.path.join(DATA_DIR, 'evidence')
 
@@ -420,4 +630,6 @@ def evidence_image(date_str, cam, filename):
 
 if __name__ == "__main__":
     init_db()
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # threaded=True важен — без него MJPEG-стрим заблокирует Flask dev-server и
+    # остальные эндпоинты перестанут отвечать пока открыт стрим.
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
